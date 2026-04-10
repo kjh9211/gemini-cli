@@ -8,10 +8,12 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { isNodeError } from '../utils/errors.js';
 import { spawnAsync } from '../utils/shell-utils.js';
-import type { SimpleGit } from 'simple-git';
-import { simpleGit, CheckRepoActions } from 'simple-git';
+import { simpleGit, CheckRepoActions, type SimpleGit } from 'simple-git';
 import type { Storage } from '../config/storage.js';
 import { debugLogger } from '../utils/debugLogger.js';
+
+export const SHADOW_REPO_AUTHOR_NAME = 'Gemini CLI';
+export const SHADOW_REPO_AUTHOR_EMAIL = 'gemini-cli@google.com';
 
 export class GitService {
   private projectRoot: string;
@@ -27,12 +29,13 @@ export class GitService {
   }
 
   async initialize(): Promise<void> {
-    const gitAvailable = await this.verifyGitAvailability();
+    const gitAvailable = await GitService.verifyGitAvailability();
     if (!gitAvailable) {
       throw new Error(
         'Checkpointing is enabled, but Git is not installed. Please install Git or disable checkpointing to continue.',
       );
     }
+    await this.storage.initialize();
     try {
       await this.setupShadowGitRepository();
     } catch (error) {
@@ -42,13 +45,30 @@ export class GitService {
     }
   }
 
-  async verifyGitAvailability(): Promise<boolean> {
+  static async verifyGitAvailability(): Promise<boolean> {
     try {
       await spawnAsync('git', ['--version']);
       return true;
-    } catch (_error) {
+    } catch {
       return false;
     }
+  }
+
+  private getShadowRepoEnv(repoDir: string) {
+    const gitConfigPath = path.join(repoDir, '.gitconfig');
+    const systemConfigPath = path.join(repoDir, '.gitconfig_system_empty');
+    return {
+      // Prevent git from using the user's global git config.
+      GIT_CONFIG_GLOBAL: gitConfigPath,
+      GIT_CONFIG_SYSTEM: systemConfigPath,
+      // Explicitly provide identity to prevent "Author identity unknown" errors
+      // inside sandboxed environments like Docker where the gitconfig might not
+      // be picked up properly.
+      GIT_AUTHOR_NAME: SHADOW_REPO_AUTHOR_NAME,
+      GIT_AUTHOR_EMAIL: SHADOW_REPO_AUTHOR_EMAIL,
+      GIT_COMMITTER_NAME: SHADOW_REPO_AUTHOR_NAME,
+      GIT_COMMITTER_EMAIL: SHADOW_REPO_AUTHOR_EMAIL,
+    };
   }
 
   /**
@@ -63,11 +83,12 @@ export class GitService {
 
     // We don't want to inherit the user's name, email, or gpg signing
     // preferences for the shadow repository, so we create a dedicated gitconfig.
-    const gitConfigContent =
-      '[user]\n  name = Gemini CLI\n  email = gemini-cli@google.com\n[commit]\n  gpgsign = false\n';
+    const gitConfigContent = `[user]\n  name = ${SHADOW_REPO_AUTHOR_NAME}\n  email = ${SHADOW_REPO_AUTHOR_EMAIL}\n[commit]\n  gpgsign = false\n`;
     await fs.writeFile(gitConfigPath, gitConfigContent);
 
-    const repo = simpleGit(repoDir);
+    const shadowRepoEnv = this.getShadowRepoEnv(repoDir);
+    await fs.writeFile(shadowRepoEnv.GIT_CONFIG_SYSTEM, '');
+    const repo = simpleGit(repoDir).env(shadowRepoEnv);
     let isRepoDefined = false;
     try {
       isRepoDefined = await repo.checkIsRepo(CheckRepoActions.IS_REPO_ROOT);
@@ -107,9 +128,7 @@ export class GitService {
     return simpleGit(this.projectRoot).env({
       GIT_DIR: path.join(repoDir, '.git'),
       GIT_WORK_TREE: this.projectRoot,
-      // Prevent git from using the user's global git config.
-      HOME: repoDir,
-      XDG_CONFIG_HOME: repoDir,
+      ...this.getShadowRepoEnv(repoDir),
     });
   }
 

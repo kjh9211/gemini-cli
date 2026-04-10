@@ -4,13 +4,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import React from 'react';
 import {
-  getErrorMessage,
-  refreshServerHierarchicalMemory,
+  addMemory,
+  listMemoryFiles,
+  refreshMemory,
+  showMemory,
 } from '@google/gemini-cli-core';
 import { MessageType } from '../types.js';
-import type { SlashCommand, SlashCommandActionReturn } from './types.js';
-import { CommandKind } from './types.js';
+import {
+  CommandKind,
+  type OpenCustomDialogActionReturn,
+  type SlashCommand,
+  type SlashCommandActionReturn,
+} from './types.js';
+import { SkillInboxDialog } from '../components/SkillInboxDialog.js';
 
 export const memoryCommand: SlashCommand = {
   name: 'memory',
@@ -24,18 +32,14 @@ export const memoryCommand: SlashCommand = {
       kind: CommandKind.BUILT_IN,
       autoExecute: true,
       action: async (context) => {
-        const memoryContent = context.services.config?.getUserMemory() || '';
-        const fileCount = context.services.config?.getGeminiMdFileCount() || 0;
-
-        const messageContent =
-          memoryContent.length > 0
-            ? `Current memory content from ${fileCount} file(s):\n\n---\n${memoryContent}\n---`
-            : 'Memory is currently empty.';
+        const config = context.services.agentContext?.config;
+        if (!config) return;
+        const result = showMemory(config);
 
         context.ui.addItem(
           {
             type: MessageType.INFO,
-            text: messageContent,
+            text: result.content,
           },
           Date.now(),
         );
@@ -47,12 +51,10 @@ export const memoryCommand: SlashCommand = {
       kind: CommandKind.BUILT_IN,
       autoExecute: false,
       action: (context, args): SlashCommandActionReturn | void => {
-        if (!args || args.trim() === '') {
-          return {
-            type: 'message',
-            messageType: 'error',
-            content: 'Usage: /memory add <text to remember>',
-          };
+        const result = addMemory(args);
+
+        if (result.type === 'message') {
+          return result;
         }
 
         context.ui.addItem(
@@ -63,64 +65,43 @@ export const memoryCommand: SlashCommand = {
           Date.now(),
         );
 
-        return {
-          type: 'tool',
-          toolName: 'save_memory',
-          toolArgs: { fact: args.trim() },
-        };
+        return result;
       },
     },
     {
-      name: 'refresh',
-      description: 'Refresh the memory from the source',
+      name: 'reload',
+      altNames: ['refresh'],
+      description: 'Reload the memory from the source',
       kind: CommandKind.BUILT_IN,
       autoExecute: true,
       action: async (context) => {
         context.ui.addItem(
           {
             type: MessageType.INFO,
-            text: 'Refreshing memory from source files...',
+            text: 'Reloading memory from source files...',
           },
           Date.now(),
         );
 
         try {
-          const config = context.services.config;
+          const config = context.services.agentContext?.config;
           if (config) {
-            let memoryContent = '';
-            let fileCount = 0;
-
-            if (config.isJitContextEnabled()) {
-              await config.getContextManager()?.refresh();
-              memoryContent = config.getUserMemory();
-              fileCount = config.getGeminiMdFileCount();
-            } else {
-              const result = await refreshServerHierarchicalMemory(config);
-              memoryContent = result.memoryContent;
-              fileCount = result.fileCount;
-            }
-
-            await config.updateSystemInstructionIfInitialized();
-
-            const successMessage =
-              memoryContent.length > 0
-                ? `Memory refreshed successfully. Loaded ${memoryContent.length} characters from ${fileCount} file(s).`
-                : 'Memory refreshed successfully. No memory content found.';
+            const result = await refreshMemory(config);
 
             context.ui.addItem(
               {
                 type: MessageType.INFO,
-                text: successMessage,
+                text: result.content,
               },
               Date.now(),
             );
           }
         } catch (error) {
-          const errorMessage = getErrorMessage(error);
           context.ui.addItem(
             {
               type: MessageType.ERROR,
-              text: `Error refreshing memory: ${errorMessage}`,
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+              text: `Error reloading memory: ${(error as Error).message}`,
             },
             Date.now(),
           );
@@ -133,21 +114,57 @@ export const memoryCommand: SlashCommand = {
       kind: CommandKind.BUILT_IN,
       autoExecute: true,
       action: async (context) => {
-        const filePaths = context.services.config?.getGeminiMdFilePaths() || [];
-        const fileCount = filePaths.length;
-
-        const messageContent =
-          fileCount > 0
-            ? `There are ${fileCount} GEMINI.md file(s) in use:\n\n${filePaths.join('\n')}`
-            : 'No GEMINI.md files in use.';
+        const config = context.services.agentContext?.config;
+        if (!config) return;
+        const result = listMemoryFiles(config);
 
         context.ui.addItem(
           {
             type: MessageType.INFO,
-            text: messageContent,
+            text: result.content,
           },
           Date.now(),
         );
+      },
+    },
+    {
+      name: 'inbox',
+      description:
+        'Review skills extracted from past sessions and move them to global or project skills',
+      kind: CommandKind.BUILT_IN,
+      autoExecute: true,
+      action: (
+        context,
+      ): OpenCustomDialogActionReturn | SlashCommandActionReturn | void => {
+        const config = context.services.agentContext?.config;
+        if (!config) {
+          return {
+            type: 'message',
+            messageType: 'error',
+            content: 'Config not loaded.',
+          };
+        }
+
+        if (!config.isMemoryManagerEnabled()) {
+          return {
+            type: 'message',
+            messageType: 'info',
+            content:
+              'The memory inbox requires the experimental memory manager. Enable it with: experimental.memoryManager = true in settings.',
+          };
+        }
+
+        return {
+          type: 'custom_dialog',
+          component: React.createElement(SkillInboxDialog, {
+            config,
+            onClose: () => context.ui.removeComponent(),
+            onReloadSkills: async () => {
+              await config.reloadSkills();
+              context.ui.reloadCommands();
+            },
+          }),
+        };
       },
     },
   ],

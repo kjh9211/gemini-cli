@@ -10,21 +10,31 @@ import type {
   ToolConfig as GenAIToolConfig,
   ToolListUnion,
 } from '@google/genai';
-import type {
-  LLMRequest,
-  LLMResponse,
-  HookToolConfig,
+import {
+  defaultHookTranslator,
+  type LLMRequest,
+  type LLMResponse,
+  type HookToolConfig,
 } from './hookTranslator.js';
-import { defaultHookTranslator } from './hookTranslator.js';
 
 /**
  * Configuration source levels in precedence order (highest to lowest)
  */
 export enum ConfigSource {
+  Runtime = 'runtime',
   Project = 'project',
   User = 'user',
   System = 'system',
   Extensions = 'extensions',
+}
+
+/**
+ * Returns true if a hook source implies it is a user-visible hook.
+ * Only System hooks are hidden by default to reduce noise.
+ */
+export function isUserVisibleHook(source?: string | ConfigSource): boolean {
+  if (!source) return true; // Treat unknown/legacy hooks as user-visible
+  return source !== ConfigSource.System;
 }
 
 /**
@@ -45,18 +55,56 @@ export enum HookEventName {
 }
 
 /**
- * Hook configuration entry
+ * Fields in the hooks configuration that are not hook event names
+ */
+export const HOOKS_CONFIG_FIELDS = ['enabled', 'disabled', 'notifications'];
+
+/**
+ * Hook implementation types
+ */
+export enum HookType {
+  Command = 'command',
+  Runtime = 'runtime',
+}
+
+/**
+ * Hook action function
+ */
+export type HookAction = (
+  input: HookInput,
+  options?: { signal: AbortSignal },
+) => Promise<HookOutput | void | null>;
+
+/**
+ * Runtime hook configuration
+ */
+export interface RuntimeHookConfig {
+  type: HookType.Runtime;
+  /** Unique name for the runtime hook */
+  name: string;
+  /** Function to execute when the hook is triggered */
+  action: HookAction;
+  command?: never;
+  source?: ConfigSource;
+  /** Maximum time allowed for hook execution in milliseconds */
+  timeout?: number;
+}
+
+/**
+ * Command hook configuration entry
  */
 export interface CommandHookConfig {
   type: HookType.Command;
   command: string;
+  action?: never;
   name?: string;
   description?: string;
   timeout?: number;
   source?: ConfigSource;
+  env?: Record<string, string>;
 }
 
-export type HookConfig = CommandHookConfig;
+export type HookConfig = CommandHookConfig | RuntimeHookConfig;
 
 /**
  * Hook definition with matcher
@@ -68,18 +116,11 @@ export interface HookDefinition {
 }
 
 /**
- * Hook implementation types
- */
-export enum HookType {
-  Command = 'command',
-}
-
-/**
  * Generate a unique key for a hook configuration
  */
 export function getHookKey(hook: HookConfig): string {
   const name = hook.name || '';
-  const command = hook.command || '';
+  const command = hook.type === HookType.Command ? hook.command : '';
   return `${name}:${command}`;
 }
 
@@ -133,6 +174,10 @@ export function createHookOutput(
       return new AfterModelHookOutput(data);
     case 'BeforeToolSelection':
       return new BeforeToolSelectionHookOutput(data);
+    case 'BeforeTool':
+      return new BeforeToolHookOutput(data);
+    case 'AfterAgent':
+      return new AfterAgentHookOutput(data);
     default:
       return new DefaultHookOutput(data);
   }
@@ -161,10 +206,17 @@ export class DefaultHookOutput implements HookOutput {
   }
 
   /**
-   * Check if this output represents a blocking decision
+   * Check if this output represents a blocking decision (block or deny)
    */
   isBlockingDecision(): boolean {
     return this.decision === 'block' || this.decision === 'deny';
+  }
+
+  /**
+   * Check if this output represents an 'ask' decision
+   */
+  isAskDecision(): boolean {
+    return this.decision === 'ask';
   }
 
   /**
@@ -178,7 +230,7 @@ export class DefaultHookOutput implements HookOutput {
    * Get the effective reason for blocking or stopping
    */
   getEffectiveReason(): string {
-    return this.reason || this.stopReason || 'No reason provided';
+    return this.stopReason || this.reason || 'No reason provided';
   }
 
   /**
@@ -206,7 +258,7 @@ export class DefaultHookOutput implements HookOutput {
   }
 
   /**
-   * Get additional context for adding to responses
+   * Get sanitized additional context for adding to responses.
    */
   getAdditionalContext(): string | undefined {
     if (
@@ -214,7 +266,12 @@ export class DefaultHookOutput implements HookOutput {
       'additionalContext' in this.hookSpecificOutput
     ) {
       const context = this.hookSpecificOutput['additionalContext'];
-      return typeof context === 'string' ? context : undefined;
+      if (typeof context !== 'string') {
+        return undefined;
+      }
+
+      // Sanitize by escaping < and > to prevent tag injection
+      return context.replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
     return undefined;
   }
@@ -231,12 +288,64 @@ export class DefaultHookOutput implements HookOutput {
     }
     return { blocked: false, reason: '' };
   }
+
+  /**
+   * Check if context clearing was requested by hook.
+   */
+  shouldClearContext(): boolean {
+    return false;
+  }
+
+  /**
+   * Optional request to execute another tool immediately after this one.
+   * The result of this tail call will replace the original tool's response.
+   */
+  getTailToolCallRequest():
+    | {
+        name: string;
+        args: Record<string, unknown>;
+      }
+    | undefined {
+    if (
+      this.hookSpecificOutput &&
+      'tailToolCallRequest' in this.hookSpecificOutput
+    ) {
+      const request = this.hookSpecificOutput['tailToolCallRequest'];
+      if (
+        typeof request === 'object' &&
+        request !== null &&
+        !Array.isArray(request)
+      ) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+        return request as { name: string; args: Record<string, unknown> };
+      }
+    }
+    return undefined;
+  }
 }
 
 /**
  * Specific hook output class for BeforeTool events.
  */
-export class BeforeToolHookOutput extends DefaultHookOutput {}
+export class BeforeToolHookOutput extends DefaultHookOutput {
+  /**
+   * Get modified tool input if provided by hook
+   */
+  getModifiedToolInput(): Record<string, unknown> | undefined {
+    if (this.hookSpecificOutput && 'tool_input' in this.hookSpecificOutput) {
+      const input = this.hookSpecificOutput['tool_input'];
+      if (
+        typeof input === 'object' &&
+        input !== null &&
+        !Array.isArray(input)
+      ) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+        return input as Record<string, unknown>;
+      }
+    }
+    return undefined;
+  }
+}
 
 /**
  * Specific hook output class for BeforeModel events
@@ -247,6 +356,7 @@ export class BeforeModelHookOutput extends DefaultHookOutput {
    */
   getSyntheticResponse(): GenerateContentResponse | undefined {
     if (this.hookSpecificOutput && 'llm_response' in this.hookSpecificOutput) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       const hookResponse = this.hookSpecificOutput[
         'llm_response'
       ] as LLMResponse;
@@ -265,12 +375,14 @@ export class BeforeModelHookOutput extends DefaultHookOutput {
     target: GenerateContentParameters,
   ): GenerateContentParameters {
     if (this.hookSpecificOutput && 'llm_request' in this.hookSpecificOutput) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       const hookRequest = this.hookSpecificOutput[
         'llm_request'
       ] as Partial<LLMRequest>;
       if (hookRequest) {
         // Convert hook format to SDK format
         const sdkRequest = defaultHookTranslator.fromHookLLMRequest(
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
           hookRequest as LLMRequest,
           target,
         );
@@ -296,6 +408,7 @@ export class BeforeToolSelectionHookOutput extends DefaultHookOutput {
     tools?: ToolListUnion;
   }): { toolConfig?: GenAIToolConfig; tools?: ToolListUnion } {
     if (this.hookSpecificOutput && 'toolConfig' in this.hookSpecificOutput) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       const hookToolConfig = this.hookSpecificOutput[
         'toolConfig'
       ] as HookToolConfig;
@@ -323,35 +436,60 @@ export class AfterModelHookOutput extends DefaultHookOutput {
    */
   getModifiedResponse(): GenerateContentResponse | undefined {
     if (this.hookSpecificOutput && 'llm_response' in this.hookSpecificOutput) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       const hookResponse = this.hookSpecificOutput[
         'llm_response'
       ] as Partial<LLMResponse>;
       if (hookResponse?.candidates?.[0]?.content?.parts?.length) {
         // Convert hook format to SDK format
         return defaultHookTranslator.fromHookLLMResponse(
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
           hookResponse as LLMResponse,
         );
       }
     }
 
-    // If hook wants to stop execution, create a synthetic stop response
-    if (this.shouldStopExecution()) {
-      const stopResponse: LLMResponse = {
-        candidates: [
-          {
-            content: {
-              role: 'model',
-              parts: [this.getEffectiveReason() || 'Execution stopped by hook'],
-            },
-            finishReason: 'STOP',
-          },
-        ],
-      };
-      return defaultHookTranslator.fromHookLLMResponse(stopResponse);
-    }
-
     return undefined;
   }
+}
+
+/**
+ * Specific hook output class for AfterAgent events
+ */
+export class AfterAgentHookOutput extends DefaultHookOutput {
+  /**
+   * Check if context clearing was requested by hook
+   */
+  override shouldClearContext(): boolean {
+    if (this.hookSpecificOutput && 'clearContext' in this.hookSpecificOutput) {
+      return this.hookSpecificOutput['clearContext'] === true;
+    }
+    return false;
+  }
+}
+
+/**
+ * Context for MCP tool executions.
+ * Contains non-sensitive connection information about the MCP server
+ * identity. Since server_name is user controlled and arbitrary, we
+ * also include connection information (e.g., command or url) to
+ * help identify the MCP server.
+ *
+ * NOTE: In the future, consider defining a shared sanitized interface
+ * from MCPServerConfig to avoid duplication and ensure consistency.
+ */
+export interface McpToolContext {
+  server_name: string;
+  tool_name: string; // Original tool name from the MCP server
+
+  // Connection info (mutually exclusive based on transport type)
+  command?: string; // For stdio transport
+  args?: string[]; // For stdio transport
+  cwd?: string; // For stdio transport
+
+  url?: string; // For SSE/HTTP transport
+
+  tcp?: string; // For WebSocket transport
 }
 
 /**
@@ -360,6 +498,8 @@ export class AfterModelHookOutput extends DefaultHookOutput {
 export interface BeforeToolInput extends HookInput {
   tool_name: string;
   tool_input: Record<string, unknown>;
+  mcp_context?: McpToolContext; // Only present for MCP tools
+  original_request_name?: string;
 }
 
 /**
@@ -368,6 +508,7 @@ export interface BeforeToolInput extends HookInput {
 export interface BeforeToolOutput extends HookOutput {
   hookSpecificOutput?: {
     hookEventName: 'BeforeTool';
+    tool_input?: Record<string, unknown>;
   };
 }
 
@@ -378,6 +519,8 @@ export interface AfterToolInput extends HookInput {
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_response: Record<string, unknown>;
+  mcp_context?: McpToolContext; // Only present for MCP tools
+  original_request_name?: string;
 }
 
 /**
@@ -387,6 +530,14 @@ export interface AfterToolOutput extends HookOutput {
   hookSpecificOutput?: {
     hookEventName: 'AfterTool';
     additionalContext?: string;
+    /**
+     * Optional request to execute another tool immediately after this one.
+     * The result of this tail call will replace the original tool's response.
+     */
+    tailToolCallRequest?: {
+      name: string;
+      args: Record<string, unknown>;
+    };
   };
 }
 
@@ -438,6 +589,16 @@ export interface AfterAgentInput extends HookInput {
   prompt: string;
   prompt_response: string;
   stop_hook_active: boolean;
+}
+
+/**
+ * AfterAgent hook output
+ */
+export interface AfterAgentOutput extends HookOutput {
+  hookSpecificOutput?: {
+    hookEventName: 'AfterAgent';
+    clearContext?: boolean;
+  };
 }
 
 /**
@@ -573,6 +734,8 @@ export interface HookExecutionResult {
   exitCode?: number;
   duration: number;
   error?: Error;
+  /** The format of the output provided by the hook */
+  outputFormat?: 'json' | 'text';
 }
 
 /**

@@ -5,14 +5,28 @@
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import type { Mocked } from 'vitest';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+  type Mocked,
+} from 'vitest';
 import { safeJsonStringify } from '../utils/safeJsonStringify.js';
-import { DiscoveredMCPTool, generateValidName } from './mcp-tool.js'; // Added getStringifiedResultForDisplay
-import type { ToolResult } from './tools.js';
-import { ToolConfirmationOutcome } from './tools.js'; // Added ToolConfirmationOutcome
+import {
+  DiscoveredMCPTool,
+  generateValidName,
+  formatMcpToolName,
+} from './mcp-tool.js'; // Added getStringifiedResultForDisplay
+import { ToolConfirmationOutcome, type ToolResult } from './tools.js';
 import type { CallableTool, Part } from '@google/genai';
 import { ToolErrorType } from './tool-error.js';
+import {
+  createMockMessageBus,
+  getMockMessageBusInstance,
+} from '../test-utils/mock-message-bus.js';
 
 // Mock @google/genai mcpToTool and CallableTool
 // We only need to mock the parts of CallableTool that DiscoveredMCPTool uses.
@@ -39,23 +53,23 @@ const createSdkResponse = (
 
 describe('generateValidName', () => {
   it('should return a valid name for a simple function', () => {
-    expect(generateValidName('myFunction')).toBe('myFunction');
+    expect(generateValidName('myFunction')).toBe('mcp_myFunction');
   });
 
   it('should replace invalid characters with underscores', () => {
     expect(generateValidName('invalid-name with spaces')).toBe(
-      'invalid-name_with_spaces',
+      'mcp_invalid-name_with_spaces',
     );
   });
 
   it('should truncate long names', () => {
     expect(generateValidName('x'.repeat(80))).toBe(
-      'xxxxxxxxxxxxxxxxxxxxxxxxxxxx___xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+      'mcp_xxxxxxxxxxxxxxxxxxxxxxxxxx...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
     );
   });
 
   it('should handle names with only invalid characters', () => {
-    expect(generateValidName('!@#$%^&*()')).toBe('__________');
+    expect(generateValidName('!@#$%^&*()')).toBe('mcp___________');
   });
 
   it.each([
@@ -68,6 +82,34 @@ describe('generateValidName', () => {
       expect(generateValidName('a'.repeat(length)).length).toBe(expected);
     },
   );
+});
+
+describe('formatMcpToolName', () => {
+  it('should format a fully qualified name', () => {
+    expect(formatMcpToolName('github', 'list_repos')).toBe(
+      'mcp_github_list_repos',
+    );
+  });
+
+  it('should handle global wildcards', () => {
+    expect(formatMcpToolName('*')).toBe('mcp_*');
+  });
+
+  it('should handle tool-level wildcards', () => {
+    expect(formatMcpToolName('github', '*')).toBe('mcp_github_*');
+  });
+
+  it('should handle both server and tool wildcards', () => {
+    expect(formatMcpToolName('*', '*')).toBe('mcp_*');
+  });
+
+  it('should handle undefined toolName as a tool-level wildcard', () => {
+    expect(formatMcpToolName('github')).toBe('mcp_github_*');
+  });
+
+  it('should format explicitly global wildcard with specific tool', () => {
+    expect(formatMcpToolName('*', 'list_repos')).toBe('mcp_*_list_repos');
+  });
 });
 
 describe('DiscoveredMCPTool', () => {
@@ -85,12 +127,15 @@ describe('DiscoveredMCPTool', () => {
   beforeEach(() => {
     mockCallTool.mockClear();
     mockToolMethod.mockClear();
+    const bus = createMockMessageBus();
+    getMockMessageBusInstance(bus).defaultToolDecision = 'ask_user';
     tool = new DiscoveredMCPTool(
       mockCallableToolInstance,
       serverName,
       serverToolName,
       baseDescription,
       inputSchema,
+      bus,
     );
     // Clear allowlist before each relevant test, especially for shouldConfirmExecute
     const invocation = tool.build({ param: 'mock' }) as any;
@@ -103,12 +148,71 @@ describe('DiscoveredMCPTool', () => {
 
   describe('constructor', () => {
     it('should set properties correctly', () => {
-      expect(tool.name).toBe(serverToolName);
-      expect(tool.schema.name).toBe(serverToolName);
+      expect(tool.name).toBe('mcp_mock-mcp-server_actual-server-tool-name');
+      expect(tool.schema.name).toBe(
+        'mcp_mock-mcp-server_actual-server-tool-name',
+      );
       expect(tool.schema.description).toBe(baseDescription);
       expect(tool.schema.parameters).toBeUndefined();
-      expect(tool.schema.parametersJsonSchema).toEqual(inputSchema);
+      expect(tool.schema.parametersJsonSchema).toEqual({
+        ...inputSchema,
+        properties: {
+          ...(inputSchema['properties'] as Record<string, unknown>),
+          wait_for_previous: {
+            type: 'boolean',
+            description:
+              'Set to true to wait for all previously requested tools in this turn to complete before starting. Set to false (or omit) to run in parallel. Use true when this tool depends on the output of previous tools.',
+          },
+        },
+      });
       expect(tool.serverToolName).toBe(serverToolName);
+    });
+  });
+
+  describe('getDisplayTitle and getExplanation', () => {
+    const commandTool = new DiscoveredMCPTool(
+      mockCallableToolInstance,
+      serverName,
+      serverToolName,
+      baseDescription,
+      {
+        type: 'object',
+        properties: { command: { type: 'string' }, path: { type: 'string' } },
+        required: ['command'],
+      },
+      createMockMessageBus(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    it('should return command as title if it exists', () => {
+      const invocation = commandTool.build({ command: 'ls -la' });
+      expect(invocation.getDisplayTitle?.()).toBe('ls -la');
+    });
+
+    it('should return displayName if command does not exist', () => {
+      const invocation = tool.build({ param: 'testValue' });
+      expect(invocation.getDisplayTitle?.()).toBe(tool.displayName);
+    });
+
+    it('should return stringified json for getExplanation', () => {
+      const params = { command: 'ls -la', path: '/' };
+      const invocation = commandTool.build(params);
+      expect(invocation.getExplanation?.()).toBe(safeJsonStringify(params));
+    });
+
+    it('should truncate and summarize long json payloads for getExplanation', () => {
+      const longString = 'a'.repeat(600);
+      const params = { command: 'echo', text: longString, other: 'value' };
+      const invocation = commandTool.build(params);
+      const explanation = invocation.getExplanation?.() ?? '';
+      expect(explanation).toMatch(
+        /^\[Payload omitted due to length with parameters: command, text, other\]$/,
+      );
     });
   });
 
@@ -190,6 +294,13 @@ describe('DiscoveredMCPTool', () => {
           serverToolName,
           baseDescription,
           inputSchema,
+          createMockMessageBus(),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
         );
         const params = { param: 'isErrorTrueCase' };
         const functionCall = {
@@ -230,6 +341,13 @@ describe('DiscoveredMCPTool', () => {
         serverToolName,
         baseDescription,
         inputSchema,
+        createMockMessageBus(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
       );
       const params = { param: 'isErrorTopLevelCase' };
       const functionCall = {
@@ -273,6 +391,13 @@ describe('DiscoveredMCPTool', () => {
           serverToolName,
           baseDescription,
           inputSchema,
+          createMockMessageBus(),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
         );
         const params = { param: 'isErrorFalseCase' };
         const mockToolSuccessResultObject = {
@@ -705,7 +830,7 @@ describe('DiscoveredMCPTool', () => {
           if (expectError) {
             try {
               await invocation.execute(controller.signal);
-            } catch (_error) {
+            } catch {
               // Expected error
             }
           } else {
@@ -728,9 +853,13 @@ describe('DiscoveredMCPTool', () => {
         serverToolName,
         baseDescription,
         inputSchema,
+        createMockMessageBus(),
         true,
         undefined,
+        undefined,
         { isTrustedFolder: () => true } as any,
+        undefined,
+        undefined,
       );
       const invocation = trustedTool.build({ param: 'mock' });
       expect(
@@ -862,15 +991,21 @@ describe('DiscoveredMCPTool', () => {
           'return confirmation details if trust is false, even if folder is trusted',
       },
     ])('should $description', async ({ trust, isTrusted, shouldConfirm }) => {
+      const bus = createMockMessageBus();
+      getMockMessageBusInstance(bus).defaultToolDecision = 'ask_user';
       const testTool = new DiscoveredMCPTool(
         mockCallableToolInstance,
         serverName,
         serverToolName,
         baseDescription,
         inputSchema,
+        bus,
         trust,
         undefined,
+        undefined,
         mockConfig(isTrusted) as any,
+        undefined,
+        undefined,
       );
       const invocation = testTool.build({ param: 'mock' });
       const confirmation = await invocation.shouldConfirmExecute(
@@ -892,6 +1027,89 @@ describe('DiscoveredMCPTool', () => {
       const invocation = tool.build(params);
       const description = invocation.getDescription();
       expect(description).toBe('{"param":"testValue","param2":"anotherOne"}');
+    });
+  });
+});
+
+describe('MCP Tool Naming Regression Fixes', () => {
+  describe('generateValidName', () => {
+    it('should replace spaces with underscores', () => {
+      expect(generateValidName('My Tool')).toBe('mcp_My_Tool');
+    });
+
+    it('should allow colons', () => {
+      expect(generateValidName('namespace:tool')).toBe('mcp_namespace:tool');
+    });
+
+    it('should ensure name starts with a letter or underscore', () => {
+      expect(generateValidName('valid_tool_name')).toBe('mcp_valid_tool_name');
+      expect(generateValidName('alsoValid-123.name')).toBe(
+        'mcp_alsoValid-123.name',
+      );
+      expect(generateValidName('another:valid:name')).toBe(
+        'mcp_another:valid:name',
+      );
+    });
+
+    it('should handle very long names by truncating in the middle', () => {
+      const longName = 'a'.repeat(40) + '__' + 'b'.repeat(40);
+      const result = generateValidName(longName);
+      expect(result.length).toBeLessThanOrEqual(63);
+      expect(result).toMatch(/^mcp_a{26}\.\.\.b{30}$/);
+    });
+
+    it('should handle very long names starting with a digit', () => {
+      const longName = '1' + 'a'.repeat(80);
+      const result = generateValidName(longName);
+      expect(result.length).toBeLessThanOrEqual(63);
+      expect(result.startsWith('mcp_1')).toBe(true);
+    });
+  });
+
+  describe('DiscoveredMCPTool qualified names', () => {
+    it('should generate a valid qualified name even with spaces in server name', () => {
+      const tool = new DiscoveredMCPTool(
+        {} as any,
+        'My Server',
+        'my-tool',
+        'desc',
+        {},
+        {} as any,
+      );
+
+      const qn = tool.getFullyQualifiedName();
+      expect(qn).toBe('mcp_My_Server_my-tool');
+    });
+
+    it('should handle long server and tool names in qualified name', () => {
+      const serverName = 'a'.repeat(40);
+      const toolName = 'b'.repeat(40);
+      const tool = new DiscoveredMCPTool(
+        {} as any,
+        serverName,
+        toolName,
+        'desc',
+        {},
+        {} as any,
+      );
+
+      const qn = tool.getFullyQualifiedName();
+      expect(qn.length).toBeLessThanOrEqual(63);
+      expect(qn).toContain('...');
+    });
+
+    it('should handle server names starting with digits', () => {
+      const tool = new DiscoveredMCPTool(
+        {} as any,
+        '123-server',
+        'tool',
+        'desc',
+        {},
+        {} as any,
+      );
+
+      const qn = tool.getFullyQualifiedName();
+      expect(qn).toBe('mcp_123-server_tool');
     });
   });
 });

@@ -6,6 +6,8 @@
 
 import { OverflowProvider } from '../../contexts/OverflowContext.js';
 import { renderWithProviders } from '../../../test-utils/render.js';
+import { createMockSettings } from '../../../test-utils/settings.js';
+import { waitFor } from '../../../test-utils/async.js';
 import { DiffRenderer } from './DiffRenderer.js';
 import * as CodeColorizer from '../../utils/CodeColorizer.js';
 import { vi } from 'vitest';
@@ -23,7 +25,7 @@ describe('<OverflowProvider><DiffRenderer /></OverflowProvider>', () => {
   describe.each([true, false])(
     'with useAlternateBuffer = %s',
     (useAlternateBuffer) => {
-      it('should call colorizeCode with correct language for new file with known extension', () => {
+      it('should call colorizeCode with correct language for new file with known extension', async () => {
         const newFileDiffContent = `
 diff --git a/test.py b/test.py
 new file mode 100644
@@ -33,7 +35,7 @@ index 0000000..e69de29
 @@ -0,0 +1 @@
 +print("hello world")
 `;
-        renderWithProviders(
+        await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer
               diffContent={newFileDiffContent}
@@ -41,19 +43,27 @@ index 0000000..e69de29
               terminalWidth={80}
             />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
-        expect(mockColorizeCode).toHaveBeenCalledWith({
-          code: 'print("hello world")',
-          language: 'python',
-          availableHeight: undefined,
-          maxWidth: 80,
-          theme: undefined,
-          settings: expect.anything(),
-        });
+        await waitFor(() =>
+          expect(mockColorizeCode).toHaveBeenCalledWith(
+            expect.objectContaining({
+              code: 'print("hello world")',
+              language: 'python',
+              availableHeight: undefined,
+              maxWidth: 80,
+              theme: undefined,
+              settings: expect.anything(),
+              disableColor: false,
+              paddingX: 0,
+            }),
+          ),
+        );
       });
 
-      it('should call colorizeCode with null language for new file with unknown extension', () => {
+      it('should call colorizeCode with null language for new file with unknown extension', async () => {
         const newFileDiffContent = `
 diff --git a/test.unknown b/test.unknown
 new file mode 100644
@@ -63,7 +73,7 @@ index 0000000..e69de29
 @@ -0,0 +1 @@
 +some content
 `;
-        renderWithProviders(
+        await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer
               diffContent={newFileDiffContent}
@@ -71,19 +81,27 @@ index 0000000..e69de29
               terminalWidth={80}
             />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
-        expect(mockColorizeCode).toHaveBeenCalledWith({
-          code: 'some content',
-          language: null,
-          availableHeight: undefined,
-          maxWidth: 80,
-          theme: undefined,
-          settings: expect.anything(),
-        });
+        await waitFor(() =>
+          expect(mockColorizeCode).toHaveBeenCalledWith(
+            expect.objectContaining({
+              code: 'some content',
+              language: null,
+              availableHeight: undefined,
+              maxWidth: 80,
+              theme: undefined,
+              settings: expect.anything(),
+              disableColor: false,
+              paddingX: 0,
+            }),
+          ),
+        );
       });
 
-      it('should call colorizeCode with null language for new file if no filename is provided', () => {
+      it('should call colorizeCode with null language for new file if no filename is provided', async () => {
         const newFileDiffContent = `
 diff --git a/test.txt b/test.txt
 new file mode 100644
@@ -93,23 +111,31 @@ index 0000000..e69de29
 @@ -0,0 +1 @@
 +some text content
 `;
-        renderWithProviders(
+        await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer diffContent={newFileDiffContent} terminalWidth={80} />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
-        expect(mockColorizeCode).toHaveBeenCalledWith({
-          code: 'some text content',
-          language: null,
-          availableHeight: undefined,
-          maxWidth: 80,
-          theme: undefined,
-          settings: expect.anything(),
-        });
+        await waitFor(() =>
+          expect(mockColorizeCode).toHaveBeenCalledWith(
+            expect.objectContaining({
+              code: 'some text content',
+              language: null,
+              availableHeight: undefined,
+              maxWidth: 80,
+              theme: undefined,
+              settings: expect.anything(),
+              disableColor: false,
+              paddingX: 0,
+            }),
+          ),
+        );
       });
 
-      it('should render diff content for existing file (not calling colorizeCode directly for the whole block)', () => {
+      it('should render diff content for existing file (not calling colorizeCode directly for the whole block)', async () => {
         const existingFileDiffContent = `
 
 diff --git a/test.txt b/test.txt
@@ -120,7 +146,7 @@ index 0000001..0000002 100644
 -old line
 +new line
 `;
-        const { lastFrame } = renderWithProviders(
+        const { lastFrame } = await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer
               diffContent={existingFileDiffContent}
@@ -128,9 +154,12 @@ index 0000001..0000002 100644
               terminalWidth={80}
             />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
         // colorizeCode is used internally by the line-by-line rendering, not for the whole block
+        await waitFor(() => expect(lastFrame()).toContain('new line'));
         expect(mockColorizeCode).not.toHaveBeenCalledWith(
           expect.objectContaining({
             code: expect.stringContaining('old line'),
@@ -144,13 +173,13 @@ index 0000001..0000002 100644
         expect(lastFrame()).toMatchSnapshot();
       });
 
-      it('should handle diff with only header and no changes', () => {
+      it('should handle diff with only header and no changes', async () => {
         const noChangeDiff = `diff --git a/file.txt b/file.txt
 index 1234567..1234567 100644
 --- a/file.txt
 +++ b/file.txt
 `;
-        const { lastFrame } = renderWithProviders(
+        const { lastFrame } = await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer
               diffContent={noChangeDiff}
@@ -158,24 +187,30 @@ index 1234567..1234567 100644
               terminalWidth={80}
             />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
+        await waitFor(() => expect(lastFrame()).toBeDefined());
         expect(lastFrame()).toMatchSnapshot();
         expect(mockColorizeCode).not.toHaveBeenCalled();
       });
 
-      it('should handle empty diff content', () => {
-        const { lastFrame } = renderWithProviders(
+      it('should handle empty diff content', async () => {
+        const { lastFrame } = await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer diffContent="" terminalWidth={80} />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
+        await waitFor(() => expect(lastFrame()).toBeDefined());
         expect(lastFrame()).toMatchSnapshot();
         expect(mockColorizeCode).not.toHaveBeenCalled();
       });
 
-      it('should render a gap indicator for skipped lines', () => {
+      it('should render a gap indicator for skipped lines', async () => {
         const diffWithGap = `
 
 diff --git a/file.txt b/file.txt
@@ -190,7 +225,7 @@ index 123..456 100644
  context line 10
  context line 11
 `;
-        const { lastFrame } = renderWithProviders(
+        const { lastFrame } = await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer
               diffContent={diffWithGap}
@@ -198,12 +233,15 @@ index 123..456 100644
               terminalWidth={80}
             />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
+        await waitFor(() => expect(lastFrame()).toContain('added line'));
         expect(lastFrame()).toMatchSnapshot();
       });
 
-      it('should not render a gap indicator for small gaps (<= MAX_CONTEXT_LINES_WITHOUT_GAP)', () => {
+      it('should not render a gap indicator for small gaps (<= MAX_CONTEXT_LINES_WITHOUT_GAP)', async () => {
         const diffWithSmallGap = `
 
 diff --git a/file.txt b/file.txt
@@ -223,7 +261,7 @@ index abc..def 100644
  context line 14
  context line 15
 `;
-        const { lastFrame } = renderWithProviders(
+        const { lastFrame } = await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer
               diffContent={diffWithSmallGap}
@@ -231,8 +269,11 @@ index abc..def 100644
               terminalWidth={80}
             />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
+        await waitFor(() => expect(lastFrame()).toContain('context line 15'));
         expect(lastFrame()).toMatchSnapshot();
       });
 
@@ -270,8 +311,8 @@ index 123..789 100644
           },
         ])(
           'with terminalWidth $terminalWidth and height $height',
-          ({ terminalWidth, height }) => {
-            const { lastFrame } = renderWithProviders(
+          async ({ terminalWidth, height }) => {
+            const { lastFrame } = await renderWithProviders(
               <OverflowProvider>
                 <DiffRenderer
                   diffContent={diffWithMultipleHunks}
@@ -280,15 +321,18 @@ index 123..789 100644
                   availableTerminalHeight={height}
                 />
               </OverflowProvider>,
-              { useAlternateBuffer },
+              {
+                settings: createMockSettings({ ui: { useAlternateBuffer } }),
+              },
             );
+            await waitFor(() => expect(lastFrame()).toContain('anotherNew'));
             const output = lastFrame();
             expect(sanitizeOutput(output, terminalWidth)).toMatchSnapshot();
           },
         );
       });
 
-      it('should correctly render a diff with a SVN diff format', () => {
+      it('should correctly render a diff with a SVN diff format', async () => {
         const newFileDiff = `
 
 fileDiff Index: file.txt
@@ -305,7 +349,7 @@ fileDiff Index: file.txt
 +const anotherNew = 'test';
 \\ No newline at end of file  
 `;
-        const { lastFrame } = renderWithProviders(
+        const { lastFrame } = await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer
               diffContent={newFileDiff}
@@ -313,12 +357,15 @@ fileDiff Index: file.txt
               terminalWidth={80}
             />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
+        await waitFor(() => expect(lastFrame()).toContain('newVar'));
         expect(lastFrame()).toMatchSnapshot();
       });
 
-      it('should correctly render a new file with no file extension correctly', () => {
+      it('should correctly render a new file with no file extension correctly', async () => {
         const newFileDiff = `
 
 fileDiff Index: Dockerfile
@@ -331,7 +378,7 @@ fileDiff Index: Dockerfile
 +RUN npm run build
 \\ No newline at end of file  
 `;
-        const { lastFrame } = renderWithProviders(
+        const { lastFrame } = await renderWithProviders(
           <OverflowProvider>
             <DiffRenderer
               diffContent={newFileDiff}
@@ -339,8 +386,11 @@ fileDiff Index: Dockerfile
               terminalWidth={80}
             />
           </OverflowProvider>,
-          { useAlternateBuffer },
+          {
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
+        await waitFor(() => expect(lastFrame()).toContain('RUN npm run build'));
         expect(lastFrame()).toMatchSnapshot();
       });
     },

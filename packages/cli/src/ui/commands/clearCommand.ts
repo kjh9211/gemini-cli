@@ -6,14 +6,13 @@
 
 import {
   uiTelemetryService,
-  fireSessionEndHook,
-  fireSessionStartHook,
   SessionEndReason,
   SessionStartSource,
   flushTelemetry,
+  resetBrowserSession,
 } from '@google/gemini-cli-core';
-import type { SlashCommand } from './types.js';
-import { CommandKind } from './types.js';
+import { CommandKind, type SlashCommand } from './types.js';
+import { MessageType } from '../types.js';
 import { randomUUID } from 'node:crypto';
 
 export const clearCommand: SlashCommand = {
@@ -22,21 +21,33 @@ export const clearCommand: SlashCommand = {
   kind: CommandKind.BUILT_IN,
   autoExecute: true,
   action: async (context, _args) => {
-    const geminiClient = context.services.config?.getGeminiClient();
-    const config = context.services.config;
-    const chatRecordingService = context.services.config
-      ?.getGeminiClient()
-      ?.getChat()
-      .getChatRecordingService();
-    const messageBus = config?.getMessageBus();
+    const geminiClient = context.services.agentContext?.geminiClient;
+    const config = context.services.agentContext?.config;
 
     // Fire SessionEnd hook before clearing
-    if (config?.getEnableHooks() && messageBus) {
-      await fireSessionEndHook(messageBus, SessionEndReason.Clear);
+    const hookSystem = config?.getHookSystem();
+    if (hookSystem) {
+      await hookSystem.fireSessionEndEvent(SessionEndReason.Clear);
+    }
+
+    // Reset user steering hints
+    config?.injectionService.clear();
+
+    // Start a new conversation recording with a new session ID
+    // We MUST do this before calling resetChat() so the new ChatRecordingService
+    // initialized by GeminiChat picks up the new session ID.
+    let newSessionId: string | undefined;
+    if (config) {
+      newSessionId = randomUUID();
+      config.setSessionId(newSessionId);
     }
 
     if (geminiClient) {
       context.ui.setDebugMessage('Clearing terminal and resetting chat.');
+
+      // Close persistent browser sessions before resetting chat
+      await resetBrowserSession();
+
       // If resetChat fails, the exception will propagate and halt the command,
       // which is the correct behavior to signal a failure to the user.
       await geminiClient.resetChat();
@@ -44,16 +55,10 @@ export const clearCommand: SlashCommand = {
       context.ui.setDebugMessage('Clearing terminal.');
     }
 
-    // Start a new conversation recording with a new session ID
-    if (config && chatRecordingService) {
-      const newSessionId = randomUUID();
-      config.setSessionId(newSessionId);
-      chatRecordingService.initialize();
-    }
-
     // Fire SessionStart hook after clearing
-    if (config?.getEnableHooks() && messageBus) {
-      await fireSessionStartHook(messageBus, SessionStartSource.Clear);
+    let result;
+    if (hookSystem) {
+      result = await hookSystem.fireSessionStartEvent(SessionStartSource.Clear);
     }
 
     // Give the event loop a chance to process any pending telemetry operations
@@ -66,7 +71,17 @@ export const clearCommand: SlashCommand = {
       await flushTelemetry(config);
     }
 
-    uiTelemetryService.setLastPromptTokenCount(0);
+    uiTelemetryService.clear(newSessionId);
     context.ui.clear();
+
+    if (result?.systemMessage) {
+      context.ui.addItem(
+        {
+          type: MessageType.INFO,
+          text: result.systemMessage,
+        },
+        Date.now(),
+      );
+    }
   },
 };

@@ -8,12 +8,12 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readFile, writeFile } from 'node:fs/promises';
 
-import type { KeyBinding } from '../packages/cli/src/config/keyBindings.js';
+import type { KeyBinding } from '../packages/cli/src/ui/key/keyBindings.js';
 import {
   commandCategories,
   commandDescriptions,
-  defaultKeyBindings,
-} from '../packages/cli/src/config/keyBindings.js';
+  defaultKeyBindingConfig,
+} from '../packages/cli/src/ui/key/keyBindings.js';
 import {
   formatWithPrettier,
   injectBetweenMarkers,
@@ -22,39 +22,12 @@ import {
 
 const START_MARKER = '<!-- KEYBINDINGS-AUTOGEN:START -->';
 const END_MARKER = '<!-- KEYBINDINGS-AUTOGEN:END -->';
-const OUTPUT_RELATIVE_PATH = ['docs', 'cli', 'keyboard-shortcuts.md'];
+const OUTPUT_RELATIVE_PATH = ['docs', 'reference', 'keyboard-shortcuts.md'];
 
-const KEY_NAME_OVERRIDES: Record<string, string> = {
-  return: 'Enter',
-  escape: 'Esc',
-  tab: 'Tab',
-  backspace: 'Backspace',
-  delete: 'Delete',
-  up: 'Up Arrow',
-  down: 'Down Arrow',
-  left: 'Left Arrow',
-  right: 'Right Arrow',
-  home: 'Home',
-  end: 'End',
-  pageup: 'Page Up',
-  pagedown: 'Page Down',
-  clear: 'Clear',
-  insert: 'Insert',
-  f1: 'F1',
-  f2: 'F2',
-  f3: 'F3',
-  f4: 'F4',
-  f5: 'F5',
-  f6: 'F6',
-  f7: 'F7',
-  f8: 'F8',
-  f9: 'F9',
-  f10: 'F10',
-  f11: 'F11',
-  f12: 'F12',
-};
+import { formatKeyBinding } from '../packages/cli/src/ui/key/keybindingUtils.js';
 
 export interface KeybindingDocCommand {
+  command: string;
   description: string;
   bindings: readonly KeyBinding[];
 }
@@ -109,8 +82,9 @@ export function buildDefaultDocSections(): readonly KeybindingDocSection[] {
   return commandCategories.map((category) => ({
     title: category.title,
     commands: category.commands.map((command) => ({
+      command: command,
       description: commandDescriptions[command],
-      bindings: defaultKeyBindings[command],
+      bindings: defaultKeyBindingConfig.get(command) ?? [],
     })),
   }));
 }
@@ -122,14 +96,14 @@ export function renderDocumentation(
     const rows = section.commands.map((command) => {
       const formattedBindings = formatBindings(command.bindings);
       const keysCell = formattedBindings.join('<br />');
-      return `| ${command.description} | ${keysCell} |`;
+      return `| \`${command.command}\` | ${command.description} | ${keysCell} |`;
     });
 
     return [
       `#### ${section.title}`,
       '',
-      '| Action | Keys |',
-      '| --- | --- |',
+      '| Command | Action | Keys |',
+      '| --- | --- | --- |',
       ...rows,
     ].join('\n');
   });
@@ -142,74 +116,14 @@ function formatBindings(bindings: readonly KeyBinding[]): string[] {
   const results: string[] = [];
 
   for (const binding of bindings) {
-    const label = formatBinding(binding);
+    const label = formatKeyBinding(binding, 'default');
     if (label && !seen.has(label)) {
       seen.add(label);
-      results.push(label);
+      results.push(`\`${label}\``);
     }
   }
 
   return results;
-}
-
-function formatBinding(binding: KeyBinding): string {
-  const modifiers: string[] = [];
-  if (binding.ctrl) modifiers.push('Ctrl');
-  if (binding.command) modifiers.push('Cmd');
-  if (binding.shift) modifiers.push('Shift');
-  if (binding.paste) modifiers.push('Paste');
-
-  const keyName = binding.key
-    ? formatKeyName(binding.key)
-    : binding.sequence
-      ? formatSequence(binding.sequence)
-      : '';
-
-  if (!keyName) {
-    return '';
-  }
-
-  const segments = [...modifiers, keyName].filter(Boolean);
-  let combo = segments.join(' + ');
-
-  const restrictions: string[] = [];
-  if (binding.ctrl === false) restrictions.push('no Ctrl');
-  if (binding.shift === false) restrictions.push('no Shift');
-  if (binding.command === false) restrictions.push('no Cmd');
-  if (binding.paste === false) restrictions.push('not Paste');
-
-  if (restrictions.length > 0) {
-    combo = `${combo} (${restrictions.join(', ')})`;
-  }
-
-  return combo ? `\`${combo}\`` : '';
-}
-
-function formatKeyName(key: string): string {
-  const normalized = key.toLowerCase();
-  if (KEY_NAME_OVERRIDES[normalized]) {
-    return KEY_NAME_OVERRIDES[normalized];
-  }
-  if (key.length === 1) {
-    return key.toUpperCase();
-  }
-  return key;
-}
-
-function formatSequence(sequence: string): string {
-  if (sequence.length === 1) {
-    const code = sequence.charCodeAt(0);
-    if (code >= 1 && code <= 26) {
-      return String.fromCharCode(code + 64);
-    }
-    if (code === 10 || code === 13) {
-      return 'Enter';
-    }
-    if (code === 9) {
-      return 'Tab';
-    }
-  }
-  return JSON.stringify(sequence);
 }
 
 if (process.argv[1]) {

@@ -4,18 +4,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { spawn } from 'node:child_process';
-import type { HookConfig } from './types.js';
-import { HookEventName, ConfigSource } from './types.js';
-import type { Config } from '../config/config.js';
-import type {
-  HookInput,
-  HookOutput,
-  HookExecutionResult,
-  BeforeAgentInput,
-  BeforeModelInput,
-  BeforeModelOutput,
+import { spawn, execSync } from 'node:child_process';
+import {
+  HookEventName,
+  ConfigSource,
+  HookType,
+  type HookConfig,
+  type CommandHookConfig,
+  type RuntimeHookConfig,
+  type HookInput,
+  type HookOutput,
+  type HookExecutionResult,
+  type BeforeAgentInput,
+  type BeforeModelInput,
+  type BeforeModelOutput,
+  type BeforeToolInput,
 } from './types.js';
+import type { Config } from '../config/config.js';
 import type { LLMRequest } from './hookTranslator.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import { sanitizeEnvironment } from '../services/environmentSanitization.js';
@@ -34,7 +39,6 @@ const DEFAULT_HOOK_TIMEOUT = 60000;
  * Exit code constants for hook execution
  */
 const EXIT_CODE_SUCCESS = 0;
-const EXIT_CODE_BLOCKING_ERROR = 2;
 const EXIT_CODE_NON_BLOCKING_ERROR = 1;
 
 /**
@@ -75,6 +79,15 @@ export class HookRunner {
     }
 
     try {
+      if (hookConfig.type === HookType.Runtime) {
+        return await this.executeRuntimeHook(
+          hookConfig,
+          eventName,
+          input,
+          startTime,
+        );
+      }
+
       return await this.executeCommandHook(
         hookConfig,
         eventName,
@@ -83,7 +96,10 @@ export class HookRunner {
       );
     } catch (error) {
       const duration = Date.now() - startTime;
-      const hookId = hookConfig.name || hookConfig.command || 'unknown';
+      const hookId =
+        hookConfig.name ||
+        (hookConfig.type === HookType.Command ? hookConfig.command : '') ||
+        'unknown';
       const errorMessage = `Hook execution failed for event '${eventName}' (hook: ${hookId}): ${error}`;
       debugLogger.warn(`Hook execution error (non-fatal): ${errorMessage}`);
 
@@ -104,10 +120,15 @@ export class HookRunner {
     hookConfigs: HookConfig[],
     eventName: HookEventName,
     input: HookInput,
+    onHookStart?: (config: HookConfig, index: number) => void,
+    onHookEnd?: (config: HookConfig, result: HookExecutionResult) => void,
   ): Promise<HookExecutionResult[]> {
-    const promises = hookConfigs.map((config) =>
-      this.executeHook(config, eventName, input),
-    );
+    const promises = hookConfigs.map(async (config, index) => {
+      onHookStart?.(config, index);
+      const result = await this.executeHook(config, eventName, input);
+      onHookEnd?.(config, result);
+      return result;
+    });
 
     return Promise.all(promises);
   }
@@ -119,12 +140,17 @@ export class HookRunner {
     hookConfigs: HookConfig[],
     eventName: HookEventName,
     input: HookInput,
+    onHookStart?: (config: HookConfig, index: number) => void,
+    onHookEnd?: (config: HookConfig, result: HookExecutionResult) => void,
   ): Promise<HookExecutionResult[]> {
     const results: HookExecutionResult[] = [];
     let currentInput = input;
 
-    for (const config of hookConfigs) {
+    for (let i = 0; i < hookConfigs.length; i++) {
+      const config = hookConfigs[i];
+      onHookStart?.(config, i);
       const result = await this.executeHook(config, eventName, currentInput);
+      onHookEnd?.(config, result);
       results.push(result);
 
       // If the hook succeeded and has output, use it to modify the input for the next hook
@@ -163,6 +189,7 @@ export class HookRunner {
               typeof additionalContext === 'string' &&
               'prompt' in modifiedInput
             ) {
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
               (modifiedInput as BeforeAgentInput).prompt +=
                 '\n\n' + additionalContext;
             }
@@ -172,20 +199,40 @@ export class HookRunner {
         case HookEventName.BeforeModel:
           if ('llm_request' in hookOutput.hookSpecificOutput) {
             // For BeforeModel, we update the LLM request
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
             const hookBeforeModelOutput = hookOutput as BeforeModelOutput;
             if (
               hookBeforeModelOutput.hookSpecificOutput?.llm_request &&
               'llm_request' in modifiedInput
             ) {
               // Merge the partial request with the existing request
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
               const currentRequest = (modifiedInput as BeforeModelInput)
                 .llm_request;
               const partialRequest =
                 hookBeforeModelOutput.hookSpecificOutput.llm_request;
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
               (modifiedInput as BeforeModelInput).llm_request = {
                 ...currentRequest,
                 ...partialRequest,
               } as LLMRequest;
+            }
+          }
+          break;
+
+        case HookEventName.BeforeTool:
+          if ('tool_input' in hookOutput.hookSpecificOutput) {
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+            const newToolInput = hookOutput.hookSpecificOutput[
+              'tool_input'
+            ] as Record<string, unknown>;
+            if (newToolInput && 'tool_input' in modifiedInput) {
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+              (modifiedInput as BeforeToolInput).tool_input = {
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+                ...(modifiedInput as BeforeToolInput).tool_input,
+                ...newToolInput,
+              };
             }
           }
           break;
@@ -200,10 +247,65 @@ export class HookRunner {
   }
 
   /**
+   * Execute a runtime hook
+   */
+  private async executeRuntimeHook(
+    hookConfig: RuntimeHookConfig,
+    eventName: HookEventName,
+    input: HookInput,
+    startTime: number,
+  ): Promise<HookExecutionResult> {
+    const timeout = hookConfig.timeout ?? DEFAULT_HOOK_TIMEOUT;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+
+    try {
+      // Create a promise that rejects after timeout
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error(`Hook timed out after ${timeout}ms`)),
+          timeout,
+        );
+      });
+
+      // Execute action with timeout race
+      const result = await Promise.race([
+        hookConfig.action(input, { signal: controller.signal }),
+        timeoutPromise,
+      ]);
+
+      const output =
+        result === null || result === undefined ? undefined : result;
+
+      return {
+        hookConfig,
+        eventName,
+        success: true,
+        output,
+        duration: Date.now() - startTime,
+      };
+    } catch (error) {
+      // Abort the ongoing hook action if it timed out or errored
+      controller.abort();
+      return {
+        hookConfig,
+        eventName,
+        success: false,
+        error: error instanceof Error ? error : new Error(String(error)),
+        duration: Date.now() - startTime,
+      };
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  }
+
+  /**
    * Execute a command hook
    */
   private async executeCommandHook(
-    hookConfig: HookConfig,
+    hookConfig: CommandHookConfig,
     eventName: HookEventName,
     input: HookInput,
     startTime: number,
@@ -231,17 +333,23 @@ export class HookRunner {
       let timedOut = false;
 
       const shellConfig = getShellConfiguration();
-      const command = this.expandCommand(
+      let command = this.expandCommand(
         hookConfig.command,
         input,
         shellConfig.shell,
       );
+
+      if (shellConfig.shell === 'powershell') {
+        // Append exit code check to ensure the exit code of the command is propagated
+        command = `${command}; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`;
+      }
 
       // Set up environment variables
       const env = {
         ...sanitizeEnvironment(process.env, this.config.sanitizationConfig),
         GEMINI_PROJECT_DIR: input.cwd,
         CLAUDE_PROJECT_DIR: input.cwd, // For compatibility
+        ...hookConfig.env,
       };
 
       const child = spawn(
@@ -258,12 +366,31 @@ export class HookRunner {
       // Set up timeout
       const timeoutHandle = setTimeout(() => {
         timedOut = true;
-        child.kill('SIGTERM');
+
+        if (process.platform === 'win32' && child.pid) {
+          try {
+            execSync(`taskkill /pid ${child.pid} /f /t`, { timeout: 2000 });
+          } catch (e) {
+            // Ignore errors if process is already dead or access denied
+            debugLogger.debug(`Taskkill failed: ${e}`);
+          }
+        } else {
+          child.kill('SIGTERM');
+        }
 
         // Force kill after 5 seconds
         setTimeout(() => {
           if (!child.killed) {
-            child.kill('SIGKILL');
+            if (process.platform === 'win32' && child.pid) {
+              try {
+                execSync(`taskkill /pid ${child.pid} /f /t`, { timeout: 2000 });
+              } catch (e) {
+                // Ignore
+                debugLogger.debug(`Taskkill failed: ${e}`);
+              }
+            } else {
+              child.kill('SIGKILL');
+            }
           }
         }, 5000);
       }, timeout);
@@ -320,27 +447,30 @@ export class HookRunner {
 
         // Parse output
         let output: HookOutput | undefined;
-        if (exitCode === EXIT_CODE_SUCCESS && stdout.trim()) {
+        let outputFormat: 'json' | 'text' | undefined;
+
+        const textToParse = stdout.trim() || stderr.trim();
+        if (textToParse) {
           try {
-            let parsed = JSON.parse(stdout.trim());
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+            let parsed = JSON.parse(textToParse);
             if (typeof parsed === 'string') {
-              // If the output is a string, parse it in case
-              // it's double-encoded JSON string.
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
               parsed = JSON.parse(parsed);
             }
-            if (parsed) {
+            if (parsed && typeof parsed === 'object') {
+              // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
               output = parsed as HookOutput;
+              outputFormat = 'json';
             }
           } catch {
             // Not JSON, convert plain text to structured output
-            output = this.convertPlainTextToHookOutput(stdout.trim(), exitCode);
+            output = this.convertPlainTextToHookOutput(
+              textToParse,
+              exitCode || EXIT_CODE_SUCCESS,
+            );
+            outputFormat = 'text';
           }
-        } else if (exitCode !== EXIT_CODE_SUCCESS && stderr.trim()) {
-          // Convert error output to structured format
-          output = this.convertPlainTextToHookOutput(
-            stderr.trim(),
-            exitCode || EXIT_CODE_NON_BLOCKING_ERROR,
-          );
         }
 
         resolve({
@@ -348,6 +478,7 @@ export class HookRunner {
           eventName,
           success: exitCode === EXIT_CODE_SUCCESS,
           output,
+          outputFormat,
           stdout,
           stderr,
           exitCode: exitCode || EXIT_CODE_SUCCESS,
@@ -396,22 +527,22 @@ export class HookRunner {
     exitCode: number,
   ): HookOutput {
     if (exitCode === EXIT_CODE_SUCCESS) {
-      // Success - treat as system message or additional context
+      // Success
       return {
         decision: 'allow',
         systemMessage: text,
       };
-    } else if (exitCode === EXIT_CODE_BLOCKING_ERROR) {
-      // Blocking error
-      return {
-        decision: 'deny',
-        reason: text,
-      };
-    } else {
-      // Non-blocking error (EXIT_CODE_NON_BLOCKING_ERROR or any other code)
+    } else if (exitCode === EXIT_CODE_NON_BLOCKING_ERROR) {
+      // Non-blocking error (EXIT_CODE_NON_BLOCKING_ERROR = 1)
       return {
         decision: 'allow',
         systemMessage: `Warning: ${text}`,
+      };
+    } else {
+      // All other non-zero exit codes (including 2) are blocking
+      return {
+        decision: 'deny',
+        reason: text,
       };
     }
   }

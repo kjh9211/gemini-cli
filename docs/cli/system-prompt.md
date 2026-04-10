@@ -14,7 +14,9 @@ core instructions will apply unless you include them yourself.
 This feature is intended for advanced users who need to enforce strict,
 project-specific behavior or create a customized persona.
 
-> Tip: You can export the current default system prompt to a file first, review
+<!-- prettier-ignore -->
+> [!TIP]
+> You can export the current default system prompt to a file first, review
 > it, and then selectively modify or replace it (see
 > [“Export the default prompt”](#export-the-default-prompt-recommended)).
 
@@ -33,7 +35,7 @@ via a `.gemini/.env` file. See
   - `GEMINI_SYSTEM_MD=/absolute/path/to/my-system.md`
   - Relative paths are supported and resolved from the current working
     directory.
-  - Tilde expansion is supported (e.g., `~/my-system.md`).
+  - Tilde expansion is supported (for example, `~/my-system.md`).
 
 - Disable the override (use built‑in prompt):
   - `GEMINI_SYSTEM_MD=false` or `GEMINI_SYSTEM_MD=0` or unset the variable.
@@ -55,6 +57,38 @@ error with: `missing system prompt file '<path>'`.
 
 When `GEMINI_SYSTEM_MD` is active, the CLI shows a `|⌐■_■|` indicator in the UI
 to signal custom system‑prompt mode.
+
+## Variable Substitution
+
+When using a custom system prompt file, you can use the following variables to
+dynamically include built-in content:
+
+- `${AgentSkills}`: Injects a complete section (including header) of all
+  available agent skills.
+- `${SubAgents}`: Injects a complete section (including header) of available
+  sub-agents.
+- `${AvailableTools}`: Injects a bulleted list of all currently enabled tool
+  names.
+- Tool Name Variables: Injects the actual name of a tool using the pattern:
+  `${toolName}_ToolName` (for example, `${write_file_ToolName}`,
+  `${run_shell_command_ToolName}`).
+
+  This pattern is generated dynamically for all available tools.
+
+### Example
+
+```markdown
+# Custom System Prompt
+
+You are a helpful assistant. ${AgentSkills}
+${SubAgents}
+
+## Tooling
+
+The following tools are available to you: ${AvailableTools}
+
+You can use ${write_file_ToolName} to save logs.
+```
 
 ## Export the default prompt (recommended)
 

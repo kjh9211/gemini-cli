@@ -27,6 +27,7 @@ export interface UpdateInfo {
 export interface UpdateObject {
   message: string;
   update: UpdateInfo;
+  isUpdating?: boolean;
 }
 
 /**
@@ -51,7 +52,7 @@ export async function checkForUpdates(
   settings: LoadedSettings,
 ): Promise<UpdateObject | null> {
   try {
-    if (settings.merged.general?.disableUpdateNag) {
+    if (!settings.merged.general.enableAutoUpdateNotification) {
       return null;
     }
     // Skip update check when running from source (development mode)

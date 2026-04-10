@@ -8,8 +8,8 @@ import type React from 'react';
 import { Box, Text } from 'ink';
 import { RadioButtonSelect } from './shared/RadioButtonSelect.js';
 import { theme } from '../semantic-colors.js';
-
-import { UserTierId } from '@google/gemini-cli-core';
+import { AuthType } from '@google/gemini-cli-core';
+import { isUltraTier } from '../../utils/tierUtils.js';
 
 interface ProQuotaDialogProps {
   failedModel: string;
@@ -17,10 +17,11 @@ interface ProQuotaDialogProps {
   message: string;
   isTerminalQuotaError: boolean;
   isModelNotFoundError?: boolean;
+  authType?: AuthType;
+  tierName?: string;
   onChoice: (
     choice: 'retry_later' | 'retry_once' | 'retry_always' | 'upgrade',
   ) => void;
-  userTier: UserTierId | undefined;
 }
 
 export function ProQuotaDialog({
@@ -29,12 +30,10 @@ export function ProQuotaDialog({
   message,
   isTerminalQuotaError,
   isModelNotFoundError,
+  authType,
+  tierName,
   onChoice,
-  userTier,
 }: ProQuotaDialogProps): React.JSX.Element {
-  // Use actual user tier if available; otherwise, default to FREE tier behavior (safe default)
-  const isPaidTier =
-    userTier === UserTierId.LEGACY || userTier === UserTierId.STANDARD;
   let items;
   // Do not provide a fallback option if failed model and fallbackmodel are same.
   if (failedModel === fallbackModel) {
@@ -50,33 +49,25 @@ export function ProQuotaDialog({
         key: 'retry_later',
       },
     ];
-  } else if (isModelNotFoundError || (isTerminalQuotaError && isPaidTier)) {
-    // out of quota
+  } else if (isModelNotFoundError || isTerminalQuotaError) {
+    const isUltra = isUltraTier(tierName);
+
+    // free users and out of quota users on G1 pro and Cloud Console gets an option to upgrade
     items = [
       {
         label: `Switch to ${fallbackModel}`,
         value: 'retry_always' as const,
         key: 'retry_always',
       },
-      {
-        label: `Stop`,
-        value: 'retry_later' as const,
-        key: 'retry_later',
-      },
-    ];
-  } else if (isTerminalQuotaError && !isPaidTier) {
-    // free user gets an option to upgrade
-    items = [
-      {
-        label: `Switch to ${fallbackModel}`,
-        value: 'retry_always' as const,
-        key: 'retry_always',
-      },
-      {
-        label: 'Upgrade for higher limits',
-        value: 'upgrade' as const,
-        key: 'upgrade',
-      },
+      ...(authType === AuthType.LOGIN_WITH_GOOGLE && !isUltra
+        ? [
+            {
+              label: 'Upgrade for higher limits',
+              value: 'upgrade' as const,
+              key: 'upgrade',
+            },
+          ]
+        : []),
       {
         label: `Stop`,
         value: 'retry_later' as const,
@@ -90,6 +81,11 @@ export function ProQuotaDialog({
         label: 'Keep trying',
         value: 'retry_once' as const,
         key: 'retry_once',
+      },
+      {
+        label: `Switch to ${fallbackModel}`,
+        value: 'retry_always' as const,
+        key: 'retry_always',
       },
       {
         label: 'Stop',

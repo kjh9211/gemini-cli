@@ -1,20 +1,59 @@
 /**
  * @license
- * Copyright 2025 Google LLC
+ * Copyright 2026 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
 
 import os from 'node:os';
-import { quote } from 'shell-quote';
+import fs from 'node:fs';
+import path from 'node:path';
+import { quote, type ParseEntry } from 'shell-quote';
 import {
   spawn,
   spawnSync,
   type SpawnOptionsWithoutStdio,
 } from 'node:child_process';
-import type { Node } from 'web-tree-sitter';
-import { Language, Parser, Query } from 'web-tree-sitter';
+
+/**
+ * Extracts the primary command name from a potentially wrapped shell command.
+ * Strips shell wrappers and handles shopt/set/etc.
+ *
+ * @param command - The full command string.
+ * @param args - The arguments for the command.
+ * @returns The primary command name.
+ */
+export async function getCommandName(
+  command: string,
+  args: string[],
+): Promise<string> {
+  await initializeShellParsers();
+  const fullCmd = [command, ...args].join(' ');
+  const stripped = stripShellWrapper(fullCmd);
+  const roots = getCommandRoots(stripped).filter(
+    (r) => r !== 'shopt' && r !== 'set',
+  );
+  if (roots.length > 0) {
+    return roots[0];
+  }
+  return path.basename(command);
+}
+
+/**
+ * Extracts a string representation from a shell-quote ParseEntry.
+ */
+export function extractStringFromParseEntry(entry: ParseEntry): string {
+  if (typeof entry === 'string') return entry;
+  if ('pattern' in entry) return entry.pattern;
+  if ('op' in entry) return entry.op;
+  if ('comment' in entry) return ''; // We can typically ignore comments for safety checks
+  return '';
+}
+import * as readline from 'node:readline';
+import { Language, Parser, Query, type Node, type Tree } from 'web-tree-sitter';
 import { loadWasmBinary } from './fileUtils.js';
 import { debugLogger } from './debugLogger.js';
+import type { SandboxManager } from '../services/sandboxManager.js';
+import { NoopSandboxManager } from '../services/sandboxManager.js';
 
 export const SHELL_TOOL_NAMES = ['run_shell_command', 'ShellTool'];
 
@@ -35,6 +74,35 @@ export interface ShellConfiguration {
   argsPrefix: string[];
   /** An identifier for the shell type. */
   shell: ShellType;
+}
+
+export async function resolveExecutable(
+  exe: string,
+): Promise<string | undefined> {
+  if (path.isAbsolute(exe)) {
+    try {
+      await fs.promises.access(exe, fs.constants.X_OK);
+      return exe;
+    } catch {
+      return undefined;
+    }
+  }
+  const paths = (process.env['PATH'] || '').split(path.delimiter);
+  const extensions =
+    os.platform() === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
+
+  for (const p of paths) {
+    for (const ext of extensions) {
+      const fullPath = path.join(p, exe + ext);
+      try {
+        await fs.promises.access(fullPath, fs.constants.X_OK);
+        return fullPath;
+      } catch {
+        continue;
+      }
+    }
+  }
+  return undefined;
 }
 
 let bashLanguage: Language | null = null;
@@ -98,7 +166,9 @@ export async function initializeShellParsers(): Promise<void> {
   if (!treeSitterInitialization) {
     treeSitterInitialization = loadBashLanguage().catch((error) => {
       treeSitterInitialization = null;
-      throw error;
+      // Log the error but don't throw, allowing the application to fall back to safe defaults (ASK_USER)
+      // or regex checks where appropriate.
+      debugLogger.debug('Failed to initialize shell parsers:', error);
     });
   }
 
@@ -108,14 +178,18 @@ export async function initializeShellParsers(): Promise<void> {
 export interface ParsedCommandDetail {
   name: string;
   text: string;
+  startIndex: number;
+  args?: string[];
 }
 
 interface CommandParseResult {
   details: ParsedCommandDetail[];
   hasError: boolean;
+  hasRedirection?: boolean;
 }
 
 const POWERSHELL_COMMAND_ENV = '__GCLI_POWERSHELL_COMMAND__';
+const PARSE_TIMEOUT_MICROS = 1000 * 1000; // 1 second
 
 // Encode the parser script as UTF-16LE base64 so we can pass it via PowerShell's -EncodedCommand flag;
 // this avoids brittle quoting/escaping when spawning PowerShell and ensures the script is received byte-for-byte.
@@ -136,23 +210,42 @@ if ($errors -and $errors.Count -gt 0) {
 }
 $commandAsts = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)
 $commandObjects = @()
+$hasRedirection = $false
 foreach ($commandAst in $commandAsts) {
+  if ($commandAst.Redirections.Count -gt 0) {
+    $hasRedirection = $true
+  }
   $name = $commandAst.GetCommandName()
   if ([string]::IsNullOrWhiteSpace($name)) {
     continue
   }
+  $args = @()
+  if ($commandAst.CommandElements.Count -gt 1) {
+    for ($i = 1; $i -lt $commandAst.CommandElements.Count; $i++) {
+      $args += $commandAst.CommandElements[$i].Extent.Text.Trim()
+    }
+  }
   $commandObjects += [PSCustomObject]@{
     name = $name
     text = $commandAst.Extent.Text.Trim()
+    args = $args
   }
 }
 [PSCustomObject]@{
   success = $true
   commands = $commandObjects
+  hasRedirection = $hasRedirection
 } | ConvertTo-Json -Compress
 `,
   'utf16le',
 ).toString('base64');
+
+const REDIRECTION_NAMES = new Set([
+  'redirection (<)',
+  'redirection (>)',
+  'heredoc (<<)',
+  'herestring (<<<)',
+]);
 
 function createParser(): Parser | null {
   if (!bashLanguage) {
@@ -171,14 +264,36 @@ function createParser(): Parser | null {
   }
 }
 
-function parseCommandTree(command: string) {
+function parseCommandTree(
+  command: string,
+  timeoutMicros: number = PARSE_TIMEOUT_MICROS,
+): Tree | null {
   const parser = createParser();
   if (!parser || !command.trim()) {
     return null;
   }
 
+  const deadline = performance.now() + timeoutMicros / 1000;
+  let timedOut = false;
+
   try {
-    return parser.parse(command);
+    const tree = parser.parse(command, null, {
+      progressCallback: () => {
+        if (performance.now() > deadline) {
+          timedOut = true;
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+          return true as unknown as void; // Returning true cancels parsing, but type says void
+        }
+      },
+    });
+
+    if (timedOut) {
+      debugLogger.error('Bash command parsing timed out for command:', command);
+      // Returning a partial tree could be risky so we return null to be safe.
+      return null;
+    }
+
+    return tree;
   } catch {
     return null;
   }
@@ -192,11 +307,21 @@ function normalizeCommandName(raw: string): string {
       return raw.slice(1, -1);
     }
   }
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return trimmed;
-  }
-  return trimmed.split(/[\\/]/).pop() ?? trimmed;
+  return raw.trim();
+}
+
+/**
+ * Normalizes a command name for sandbox policy lookups.
+ * Converts to lowercase and removes the .exe extension for cross-platform consistency.
+ *
+ * @param commandName - The command name to normalize.
+ * @returns The normalized command name.
+ */
+export function normalizeCommand(commandName: string): string {
+  // Split by both separators and get the last non-empty part
+  const parts = commandName.split(/[\\/]/).filter(Boolean);
+  const base = parts.length > 0 ? parts[parts.length - 1] : '';
+  return base.toLowerCase().replace(/\.exe$/, '');
 }
 
 function extractNameFromNode(node: Node): string | null {
@@ -217,6 +342,24 @@ function extractNameFromNode(node: Node): string | null {
       }
       return normalizeCommandName(firstChild.text);
     }
+    case 'file_redirect': {
+      // The first child might be a file descriptor (e.g., '2>').
+      // We iterate to find the actual operator token.
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (child && child.text.includes('<')) {
+          return 'redirection (<)';
+        }
+        if (child && child.text.includes('>')) {
+          return 'redirection (>)';
+        }
+      }
+      return 'redirection (>)';
+    }
+    case 'heredoc_redirect':
+      return 'heredoc (<<)';
+    case 'herestring_redirect':
+      return 'herestring (<<<)';
     default:
       return null;
   }
@@ -230,21 +373,40 @@ function collectCommandDetails(
   const details: ParsedCommandDetail[] = [];
 
   while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current) {
-      continue;
-    }
+    const current = stack.pop()!;
 
-    const commandName = extractNameFromNode(current);
-    if (commandName) {
-      details.push({
-        name: commandName,
+    const name = extractNameFromNode(current);
+    if (name) {
+      const detail: ParsedCommandDetail = {
+        name,
         text: source.slice(current.startIndex, current.endIndex).trim(),
-      });
+        startIndex: current.startIndex,
+      };
+
+      if (current.type === 'command') {
+        const args: string[] = [];
+        const nameNode = current.childForFieldName('name');
+        for (let i = 0; i < current.childCount; i += 1) {
+          const child = current.child(i);
+          if (
+            child &&
+            child.type === 'word' &&
+            child.startIndex !== nameNode?.startIndex
+          ) {
+            args.push(child.text);
+          }
+        }
+        if (args.length > 0) {
+          detail.args = args;
+        }
+      }
+
+      details.push(detail);
     }
 
-    for (let i = current.namedChildCount - 1; i >= 0; i -= 1) {
-      const child = current.namedChild(i);
+    // Traverse all children to find all sub-components (commands, redirections, etc.)
+    for (let i = current.childCount - 1; i >= 0; i -= 1) {
+      const child = current.child(i);
       if (child) {
         stack.push(child);
       }
@@ -288,9 +450,15 @@ function hasPromptCommandTransform(root: Node): boolean {
   return false;
 }
 
-function parseBashCommandDetails(command: string): CommandParseResult | null {
+export function parseBashCommandDetails(
+  command: string,
+): CommandParseResult | null {
   if (treeSitterInitializationError) {
-    throw treeSitterInitializationError;
+    debugLogger.debug(
+      'Bash parser not initialized:',
+      treeSitterInitializationError,
+    );
+    return null;
   }
 
   if (!bashLanguage) {
@@ -329,14 +497,14 @@ function parseBashCommandDetails(command: string): CommandParseResult | null {
         'Syntax Errors:',
         syntaxErrors,
       );
-    } catch (_e) {
+    } catch {
       // Ignore query errors
     } finally {
       query?.delete();
     }
   }
   return {
-    details,
+    details: details.sort((a, b) => a.startIndex - b.startIndex),
     hasError,
   };
 }
@@ -383,9 +551,11 @@ function parsePowerShellCommandDetails(
 
     let parsed: {
       success?: boolean;
-      commands?: Array<{ name?: string; text?: string }>;
+      commands?: Array<{ name?: string; text?: string; args?: string[] }>;
+      hasRedirection?: boolean;
     } | null = null;
     try {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       parsed = JSON.parse(output);
     } catch {
       return { details: [], hasError: true };
@@ -396,7 +566,7 @@ function parsePowerShellCommandDetails(
     }
 
     const details = (parsed.commands ?? [])
-      .map((commandDetail) => {
+      .map((commandDetail): ParsedCommandDetail | null => {
         if (!commandDetail || typeof commandDetail.name !== 'string') {
           return null;
         }
@@ -410,6 +580,10 @@ function parsePowerShellCommandDetails(
         return {
           name,
           text,
+          startIndex: 0,
+          args: Array.isArray(commandDetail.args)
+            ? commandDetail.args
+            : undefined,
         };
       })
       .filter((detail): detail is ParsedCommandDetail => detail !== null);
@@ -417,6 +591,7 @@ function parsePowerShellCommandDetails(
     return {
       details,
       hasError: details.length === 0,
+      hasRedirection: parsed.hasRedirection,
     };
   } catch {
     return null;
@@ -429,7 +604,19 @@ export function parseCommandDetails(
   const configuration = getShellConfiguration();
 
   if (configuration.shell === 'powershell') {
-    return parsePowerShellCommandDetails(command, configuration.executable);
+    const result = parsePowerShellCommandDetails(
+      command,
+      configuration.executable,
+    );
+    if (!result || result.hasError) {
+      // Fallback to bash parser which is usually good enough for simple commands
+      // and doesn't rely on the host PowerShell environment restrictions (e.g., ConstrainedLanguage)
+      const bashResult = parseBashCommandDetails(command);
+      if (bashResult && !bashResult.hasError) {
+        return bashResult;
+      }
+    }
+    return result;
   }
 
   if (configuration.shell === 'bash') {
@@ -514,13 +701,66 @@ export function escapeShellArg(arg: string, shell: ShellType): string {
  * @param command The shell command string to parse
  * @returns An array of individual command strings
  */
+/**
+ * Checks if a command contains redirection operators.
+ * Uses shell-specific parsers where possible, falling back to a broad regex check.
+ */
+export function hasRedirection(command: string): boolean {
+  const fallbackCheck = () => /[><]/.test(command);
+
+  // If there are no redirection characters at all, we can skip parsing.
+  if (!fallbackCheck()) {
+    return false;
+  }
+
+  const configuration = getShellConfiguration();
+
+  if (configuration.shell === 'powershell') {
+    const parsed = parsePowerShellCommandDetails(
+      command,
+      configuration.executable,
+    );
+    return parsed && !parsed.hasError
+      ? !!parsed.hasRedirection
+      : fallbackCheck();
+  }
+
+  if (configuration.shell === 'bash' && bashLanguage) {
+    const tree = parseCommandTree(command);
+    if (!tree) return fallbackCheck();
+
+    const stack: Node[] = [tree.rootNode];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      if (
+        current.type === 'redirected_statement' ||
+        current.type === 'file_redirect' ||
+        current.type === 'heredoc_redirect' ||
+        current.type === 'herestring_redirect'
+      ) {
+        return true;
+      }
+      for (let i = current.childCount - 1; i >= 0; i -= 1) {
+        const child = current.child(i);
+        if (child) stack.push(child);
+      }
+    }
+    return false;
+  }
+
+  return fallbackCheck();
+}
+
 export function splitCommands(command: string): string[] {
   const parsed = parseCommandDetails(command);
   if (!parsed || parsed.hasError) {
     return [];
   }
 
-  return parsed.details.map((detail) => detail.text).filter(Boolean);
+  return parsed.details
+    .filter((detail) => !REDIRECTION_NAMES.has(detail.name))
+    .map((detail) => detail.text)
+    .filter(Boolean);
 }
 
 /**
@@ -550,12 +790,15 @@ export function getCommandRoots(command: string): string[] {
     return [];
   }
 
-  return parsed.details.map((detail) => detail.name).filter(Boolean);
+  return parsed.details
+    .map((detail) => detail.name)
+    .filter((name) => !REDIRECTION_NAMES.has(name))
+    .filter(Boolean);
 }
 
 export function stripShellWrapper(command: string): string {
   const pattern =
-    /^\s*(?:(?:sh|bash|zsh)\s+-c|cmd\.exe\s+\/c|powershell(?:\.exe)?\s+(?:-NoProfile\s+)?-Command|pwsh(?:\.exe)?\s+(?:-NoProfile\s+)?-Command)\s+/i;
+    /^\s*(?:(?:(?:\S+\/)?(?:sh|bash|zsh))\s+-c|cmd\.exe\s+\/c|powershell(?:\.exe)?\s+(?:-NoProfile\s+)?-Command|pwsh(?:\.exe)?\s+(?:-NoProfile\s+)?-Command)\s+/i;
   const match = command.match(pattern);
   if (match) {
     let newCommand = command.substring(match[0].length).trim();
@@ -589,33 +832,191 @@ export function stripShellWrapper(command: string): string {
  * @param config The application configuration.
  * @returns An object with 'allowed' boolean and optional 'reason' string if not allowed.
  */
-export const spawnAsync = (
+export const spawnAsync = async (
   command: string,
   args: string[],
-  options?: SpawnOptionsWithoutStdio,
-): Promise<{ stdout: string; stderr: string }> =>
-  new Promise((resolve, reject) => {
-    const child = spawn(command, args, options);
-    let stdout = '';
-    let stderr = '';
+  options?: SpawnOptionsWithoutStdio & { sandboxManager?: SandboxManager },
+): Promise<{ stdout: string; stderr: string }> => {
+  const sandboxManager = options?.sandboxManager ?? new NoopSandboxManager();
+  const prepared = await sandboxManager.prepareCommand({
+    command,
+    args,
+    cwd: options?.cwd?.toString() ?? process.cwd(),
+    env: options?.env ?? process.env,
+  });
 
-    child.stdout.on('data', (data) => {
-      stdout += data.toString();
+  const { program: finalCommand, args: finalArgs, env: finalEnv } = prepared;
+
+  try {
+    return await new Promise((resolve, reject) => {
+      const child = spawn(finalCommand, finalArgs, {
+        ...options,
+        env: finalEnv,
+      });
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        if (code === 0) {
+          resolve({ stdout, stderr });
+        } else {
+          reject(
+            new Error(`Command failed with exit code ${code}:\n${stderr}`),
+          );
+        }
+      });
+
+      child.on('error', (err) => {
+        reject(err);
+      });
+    });
+  } finally {
+    prepared.cleanup?.();
+  }
+};
+
+/**
+ * Executes a command and yields lines of output as they appear.
+ * Use for large outputs where buffering is not feasible.
+ *
+ * @param command The executable to run
+ * @param args Arguments for the executable
+ * @param options Spawn options (cwd, env, etc.)
+ */
+export async function* execStreaming(
+  command: string,
+  args: string[],
+  options?: SpawnOptionsWithoutStdio & {
+    signal?: AbortSignal;
+    allowedExitCodes?: number[];
+    sandboxManager?: SandboxManager;
+  },
+): AsyncGenerator<string, void, void> {
+  const sandboxManager = options?.sandboxManager ?? new NoopSandboxManager();
+  const prepared = await sandboxManager.prepareCommand({
+    command,
+    args,
+    cwd: options?.cwd?.toString() ?? process.cwd(),
+    env: options?.env ?? process.env,
+  });
+
+  try {
+    const { program: finalCommand, args: finalArgs, env: finalEnv } = prepared;
+
+    const child = spawn(finalCommand, finalArgs, {
+      ...options,
+      env: finalEnv,
+      // ensure we don't open a window on windows if possible/relevant
+      windowsHide: true,
     });
 
-    child.stderr.on('data', (data) => {
-      stderr += data.toString();
+    const rl = readline.createInterface({
+      input: child.stdout,
+      terminal: false,
     });
 
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve({ stdout, stderr });
-      } else {
-        reject(new Error(`Command failed with exit code ${code}:\n${stderr}`));
+    const errorChunks: Buffer[] = [];
+    let stderrTotalBytes = 0;
+    const MAX_STDERR_BYTES = 20 * 1024; // 20KB limit
+
+    child.stderr.on('data', (chunk) => {
+      if (stderrTotalBytes < MAX_STDERR_BYTES) {
+        errorChunks.push(chunk);
+        stderrTotalBytes += chunk.length;
       }
     });
 
+    let error: Error | null = null;
     child.on('error', (err) => {
-      reject(err);
+      error = err;
     });
-  });
+
+    const onAbort = () => {
+      // If manually aborted by signal, we kill immediately.
+      if (!child.killed) child.kill();
+    };
+
+    if (options?.signal?.aborted) {
+      onAbort();
+    } else {
+      options?.signal?.addEventListener('abort', onAbort);
+    }
+
+    let finished = false;
+    try {
+      for await (const line of rl) {
+        if (options?.signal?.aborted) break;
+        yield line;
+      }
+      finished = true;
+    } finally {
+      rl.close();
+      options?.signal?.removeEventListener('abort', onAbort);
+
+      // Ensure process is killed when the generator is closed (consumer breaks loop)
+      let killedByGenerator = false;
+      if (!finished && child.exitCode === null && !child.killed) {
+        try {
+          child.kill();
+        } catch {
+          // ignore error if process is already dead
+        }
+        killedByGenerator = true;
+      }
+
+      // Ensure we wait for the process to exit to check codes
+      await new Promise<void>((resolve, reject) => {
+        // If an error occurred before we got here (e.g. spawn failure), reject immediately.
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        function checkExit(code: number | null) {
+          // If we aborted or killed it manually, we treat it as success (stop waiting)
+          if (options?.signal?.aborted || killedByGenerator) {
+            resolve();
+            return;
+          }
+
+          const allowed = options?.allowedExitCodes ?? [0];
+          if (code !== null && allowed.includes(code)) {
+            resolve();
+          } else {
+            // If we have an accumulated error or explicit error event
+            if (error) reject(error);
+            else {
+              const stderr = Buffer.concat(errorChunks).toString('utf8');
+              const truncatedMsg =
+                stderrTotalBytes >= MAX_STDERR_BYTES ? '...[truncated]' : '';
+              reject(
+                new Error(
+                  `Process exited with code ${code}: ${stderr}${truncatedMsg}`,
+                ),
+              );
+            }
+          }
+        }
+
+        if (child.exitCode !== null) {
+          checkExit(child.exitCode);
+        } else {
+          child.on('close', (code) => checkExit(code));
+          child.on('error', (err) => {
+            reject(err);
+          });
+        }
+      });
+    }
+  } finally {
+    prepared.cleanup?.();
+  }
+}

@@ -13,15 +13,16 @@ import {
   type EditorDisplay,
 } from '../editors/editorSettingsManager.js';
 import { RadioButtonSelect } from './shared/RadioButtonSelect.js';
-import type {
-  LoadableSettingScope,
-  LoadedSettings,
+import {
+  SettingScope,
+  type LoadableSettingScope,
+  type LoadedSettings,
 } from '../../config/settings.js';
-import { SettingScope } from '../../config/settings.js';
 import {
   type EditorType,
   isEditorAvailable,
   EDITOR_DISPLAY_NAMES,
+  coreEvents,
 } from '@google/gemini-cli-core';
 import { useKeypress } from '../hooks/useKeypress.js';
 
@@ -49,10 +50,13 @@ export function EditorSettingsDialog({
     (key) => {
       if (key.name === 'tab') {
         setFocusedSection((prev) => (prev === 'editor' ? 'scope' : 'editor'));
+        return true;
       }
       if (key.name === 'escape') {
         onExit();
+        return true;
       }
+      return false;
     },
     { isActive: true },
   );
@@ -68,7 +72,10 @@ export function EditorSettingsDialog({
       )
     : 0;
   if (editorIndex === -1) {
-    console.error(`Editor is not supported: ${currentPreference}`);
+    coreEvents.emitFeedback(
+      'error',
+      `Editor is not supported: ${currentPreference}`,
+    );
     editorIndex = 0;
   }
 
@@ -120,12 +127,13 @@ export function EditorSettingsDialog({
 
   let mergedEditorName = 'None';
   if (
-    settings.merged.general?.preferredEditor &&
-    isEditorAvailable(settings.merged.general?.preferredEditor)
+    settings.merged.general.preferredEditor &&
+    isEditorAvailable(settings.merged.general.preferredEditor)
   ) {
     mergedEditorName =
       EDITOR_DISPLAY_NAMES[
-        settings.merged.general?.preferredEditor as EditorType
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+        settings.merged.general.preferredEditor as EditorType
       ];
   }
 

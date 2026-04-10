@@ -12,6 +12,7 @@ import type {
   FunctionCallingConfig,
 } from '@google/genai';
 import { DEFAULT_GEMINI_FLASH_MODEL } from '../config/models.js';
+import { getResponseText } from '../utils/partUtils.js';
 
 /**
  * Decoupled LLM request format - stable across Gemini CLI versions
@@ -224,23 +225,30 @@ export class HookTranslatorGenAIv1 extends HookTranslator {
     hookRequest: LLMRequest,
     baseRequest?: GenerateContentParameters,
   ): GenerateContentParameters {
-    // Convert hook messages back to SDK Content format
-    const contents = hookRequest.messages.map((message) => ({
-      role: message.role === 'model' ? 'model' : message.role,
-      parts: [
-        {
-          text:
-            typeof message.content === 'string'
-              ? message.content
-              : String(message.content),
-        },
-      ],
-    }));
+    // Convert hook messages back to SDK Content format.
+    // If the hook returned a partial request without messages (e.g. only
+    // overriding `model`), fall back to the base request's contents so the
+    // conversation is preserved.
+    const contents = hookRequest.messages
+      ? hookRequest.messages.map((message) => ({
+          role: message.role === 'model' ? 'model' : message.role,
+          parts: [
+            {
+              text:
+                typeof message.content === 'string'
+                  ? message.content
+                  : String(message.content),
+            },
+          ],
+        }))
+      : (baseRequest?.contents ?? []);
 
-    // Build the result with proper typing
+    // Build the result with proper typing.
+    // Use nullish coalescing so a hook that only sets `model` still works --
+    // fall back to the base request's model rather than overwriting with undefined.
     const result: GenerateContentParameters = {
       ...baseRequest,
-      model: hookRequest.model,
+      model: hookRequest.model ?? baseRequest?.model ?? '',
       contents,
     };
 
@@ -267,7 +275,7 @@ export class HookTranslatorGenAIv1 extends HookTranslator {
    */
   toHookLLMResponse(sdkResponse: GenerateContentResponse): LLMResponse {
     return {
-      text: sdkResponse.text,
+      text: getResponseText(sdkResponse) ?? undefined,
       candidates: (sdkResponse.candidates || []).map((candidate) => {
         // Extract text parts from the candidate
         const textParts =
@@ -281,6 +289,7 @@ export class HookTranslatorGenAIv1 extends HookTranslator {
             parts: textParts,
           },
           finishReason:
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
             candidate.finishReason as LLMResponse['candidates'][0]['finishReason'],
           index: candidate.index,
           safetyRatings: candidate.safetyRatings?.map((rating) => ({
@@ -305,6 +314,7 @@ export class HookTranslatorGenAIv1 extends HookTranslator {
    */
   fromHookLLMResponse(hookResponse: LLMResponse): GenerateContentResponse {
     // Build response object with proper structure
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
     const response: GenerateContentResponse = {
       text: hookResponse.text,
       candidates: hookResponse.candidates.map((candidate) => ({
@@ -314,6 +324,7 @@ export class HookTranslatorGenAIv1 extends HookTranslator {
             text: part,
           })),
         },
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
         finishReason: candidate.finishReason as FinishReason,
         index: candidate.index,
         safetyRatings: candidate.safetyRatings,
@@ -329,6 +340,7 @@ export class HookTranslatorGenAIv1 extends HookTranslator {
    */
   toHookToolConfig(sdkToolConfig: ToolConfig): HookToolConfig {
     return {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       mode: sdkToolConfig.functionCallingConfig?.mode as HookToolConfig['mode'],
       allowedFunctionNames:
         sdkToolConfig.functionCallingConfig?.allowedFunctionNames,
@@ -341,7 +353,8 @@ export class HookTranslatorGenAIv1 extends HookTranslator {
   fromHookToolConfig(hookToolConfig: HookToolConfig): ToolConfig {
     const functionCallingConfig: FunctionCallingConfig | undefined =
       hookToolConfig.mode || hookToolConfig.allowedFunctionNames
-        ? ({
+        ? // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+          ({
             mode: hookToolConfig.mode,
             allowedFunctionNames: hookToolConfig.allowedFunctionNames,
           } as FunctionCallingConfig)

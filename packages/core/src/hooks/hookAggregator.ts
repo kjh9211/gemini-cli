@@ -5,19 +5,18 @@
  */
 
 import { FunctionCallingConfigMode } from '@google/genai';
-import type {
-  HookOutput,
-  HookExecutionResult,
-  BeforeToolSelectionOutput,
-} from './types.js';
 import {
   DefaultHookOutput,
   BeforeToolHookOutput,
   BeforeModelHookOutput,
   BeforeToolSelectionHookOutput,
   AfterModelHookOutput,
+  AfterAgentHookOutput,
+  HookEventName,
+  type HookOutput,
+  type HookExecutionResult,
+  type BeforeToolSelectionOutput,
 } from './types.js';
-import { HookEventName } from './types.js';
 
 /**
  * Aggregated hook result
@@ -101,6 +100,7 @@ export class HookAggregator {
 
       case HookEventName.BeforeToolSelection:
         return this.mergeToolSelectionOutputs(
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
           outputs as BeforeToolSelectionOutput[],
         );
 
@@ -125,6 +125,7 @@ export class HookAggregator {
     const additionalContexts: string[] = [];
 
     let hasBlockDecision = false;
+    let hasAskDecision = false;
     let hasContinueFalse = false;
 
     for (const output of outputs) {
@@ -142,6 +143,12 @@ export class HookAggregator {
       if (tempOutput.isBlockingDecision()) {
         hasBlockDecision = true;
         merged.decision = output.decision;
+      } else if (tempOutput.isAskDecision()) {
+        hasAskDecision = true;
+        // Ask decision is only set if no blocking decision was found so far
+        if (!hasBlockDecision) {
+          merged.decision = output.decision;
+        }
       }
 
       // Collect messages
@@ -158,12 +165,30 @@ export class HookAggregator {
         merged.suppressOutput = true;
       }
 
+      // Handle clearContext (any true wins) - for AfterAgent hooks
+      if (output.hookSpecificOutput?.['clearContext'] === true) {
+        merged.hookSpecificOutput = {
+          ...(merged.hookSpecificOutput || {}),
+          clearContext: true,
+        };
+      }
+
+      // Merge hookSpecificOutput (excluding clearContext which is handled above)
+      if (output.hookSpecificOutput) {
+        const { clearContext: _clearContext, ...restSpecificOutput } =
+          output.hookSpecificOutput;
+        merged.hookSpecificOutput = {
+          ...(merged.hookSpecificOutput || {}),
+          ...restSpecificOutput,
+        };
+      }
+
       // Collect additional context from hook-specific outputs
       this.extractAdditionalContext(output, additionalContexts);
     }
 
-    // Set final decision if no blocking decision was found
-    if (!hasBlockDecision && !hasContinueFalse) {
+    // Set final decision if no blocking or ask decision was found
+    if (!hasBlockDecision && !hasAskDecision && !hasContinueFalse) {
       merged.decision = 'allow';
     }
 
@@ -315,6 +340,8 @@ export class HookAggregator {
         return new BeforeToolSelectionHookOutput(output);
       case HookEventName.AfterModel:
         return new AfterModelHookOutput(output);
+      case HookEventName.AfterAgent:
+        return new AfterAgentHookOutput(output);
       default:
         return new DefaultHookOutput(output);
     }
@@ -335,6 +362,7 @@ export class HookAggregator {
     // Extract additionalContext from various hook types
     if (
       'additionalContext' in specific &&
+      // eslint-disable-next-line no-restricted-syntax
       typeof specific['additionalContext'] === 'string'
     ) {
       contexts.push(specific['additionalContext']);

@@ -12,8 +12,8 @@ import { RadioButtonSelect } from './shared/RadioButtonSelect.js';
 
 import {
   PREVIEW_GEMINI_MODEL,
-  UserTierId,
   DEFAULT_GEMINI_FLASH_MODEL,
+  AuthType,
 } from '@google/gemini-cli-core';
 
 // Mock the child component to make it easier to test the parent
@@ -29,15 +29,14 @@ describe('ProQuotaDialog', () => {
   });
 
   describe('for flash model failures', () => {
-    it('should render "Keep trying" and "Stop" options', () => {
-      const { unmount } = render(
+    it('should render "Keep trying" and "Stop" options', async () => {
+      const { unmount } = await render(
         <ProQuotaDialog
           failedModel={DEFAULT_GEMINI_FLASH_MODEL}
           fallbackModel={DEFAULT_GEMINI_FLASH_MODEL}
           message="flash error"
           isTerminalQuotaError={true} // should not matter
           onChoice={mockOnChoice}
-          userTier={UserTierId.FREE}
         />,
       );
 
@@ -64,81 +63,16 @@ describe('ProQuotaDialog', () => {
 
   describe('for non-flash model failures', () => {
     describe('when it is a terminal quota error', () => {
-      it('should render switch and stop options for paid tiers', () => {
-        const { unmount } = render(
+      it('should render switch, upgrade, and stop options for LOGIN_WITH_GOOGLE', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-2.5-pro"
             fallbackModel="gemini-2.5-flash"
             message="paid tier quota error"
             isTerminalQuotaError={true}
             isModelNotFoundError={false}
+            authType={AuthType.LOGIN_WITH_GOOGLE}
             onChoice={mockOnChoice}
-            userTier={UserTierId.LEGACY}
-          />,
-        );
-
-        expect(RadioButtonSelect).toHaveBeenCalledWith(
-          expect.objectContaining({
-            items: [
-              {
-                label: 'Switch to gemini-2.5-flash',
-                value: 'retry_always',
-                key: 'retry_always',
-              },
-              {
-                label: 'Stop',
-                value: 'retry_later',
-                key: 'retry_later',
-              },
-            ],
-          }),
-          undefined,
-        );
-        unmount();
-      });
-
-      it('should render "Keep trying" and "Stop" options when failed model and fallback model are the same', () => {
-        const { unmount } = render(
-          <ProQuotaDialog
-            failedModel={PREVIEW_GEMINI_MODEL}
-            fallbackModel={PREVIEW_GEMINI_MODEL}
-            message="flash error"
-            isTerminalQuotaError={true}
-            onChoice={mockOnChoice}
-            userTier={UserTierId.FREE}
-          />,
-        );
-
-        expect(RadioButtonSelect).toHaveBeenCalledWith(
-          expect.objectContaining({
-            items: [
-              {
-                label: 'Keep trying',
-                value: 'retry_once',
-                key: 'retry_once',
-              },
-              {
-                label: 'Stop',
-                value: 'retry_later',
-                key: 'retry_later',
-              },
-            ],
-          }),
-          undefined,
-        );
-        unmount();
-      });
-
-      it('should render switch, upgrade, and stop options for free tier', () => {
-        const { unmount } = render(
-          <ProQuotaDialog
-            failedModel="gemini-2.5-pro"
-            fallbackModel="gemini-2.5-flash"
-            message="free tier quota error"
-            isTerminalQuotaError={true}
-            isModelNotFoundError={false}
-            onChoice={mockOnChoice}
-            userTier={UserTierId.FREE}
           />,
         );
 
@@ -166,19 +100,17 @@ describe('ProQuotaDialog', () => {
         );
         unmount();
       });
-    });
 
-    describe('when it is a capacity error', () => {
-      it('should render keep trying and stop options', () => {
-        const { unmount } = render(
+      it('should NOT render upgrade option for USE_GEMINI', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-2.5-pro"
             fallbackModel="gemini-2.5-flash"
-            message="capacity error"
-            isTerminalQuotaError={false}
+            message="paid tier quota error"
+            isTerminalQuotaError={true}
             isModelNotFoundError={false}
+            authType={AuthType.USE_GEMINI}
             onChoice={mockOnChoice}
-            userTier={UserTierId.FREE}
           />,
         );
 
@@ -186,38 +118,7 @@ describe('ProQuotaDialog', () => {
           expect.objectContaining({
             items: [
               {
-                label: 'Keep trying',
-                value: 'retry_once',
-                key: 'retry_once',
-              },
-              { label: 'Stop', value: 'retry_later', key: 'retry_later' },
-            ],
-          }),
-          undefined,
-        );
-        unmount();
-      });
-    });
-
-    describe('when it is a model not found error', () => {
-      it('should render switch and stop options regardless of tier', () => {
-        const { unmount } = render(
-          <ProQuotaDialog
-            failedModel="gemini-3-pro-preview"
-            fallbackModel="gemini-2.5-pro"
-            message="You don't have access to gemini-3-pro-preview yet."
-            isTerminalQuotaError={false}
-            isModelNotFoundError={true}
-            onChoice={mockOnChoice}
-            userTier={UserTierId.FREE}
-          />,
-        );
-
-        expect(RadioButtonSelect).toHaveBeenCalledWith(
-          expect.objectContaining({
-            items: [
-              {
-                label: 'Switch to gemini-2.5-pro',
+                label: 'Switch to gemini-2.5-flash',
                 value: 'retry_always',
                 key: 'retry_always',
               },
@@ -233,16 +134,194 @@ describe('ProQuotaDialog', () => {
         unmount();
       });
 
-      it('should render switch and stop options for paid tier as well', () => {
-        const { unmount } = render(
+      it('should render "Keep trying" and "Stop" options when failed model and fallback model are the same', async () => {
+        const { unmount } = await render(
+          <ProQuotaDialog
+            failedModel={PREVIEW_GEMINI_MODEL}
+            fallbackModel={PREVIEW_GEMINI_MODEL}
+            message="flash error"
+            isTerminalQuotaError={true}
+            onChoice={mockOnChoice}
+          />,
+        );
+
+        expect(RadioButtonSelect).toHaveBeenCalledWith(
+          expect.objectContaining({
+            items: [
+              {
+                label: 'Keep trying',
+                value: 'retry_once',
+                key: 'retry_once',
+              },
+              {
+                label: 'Stop',
+                value: 'retry_later',
+                key: 'retry_later',
+              },
+            ],
+          }),
+          undefined,
+        );
+        unmount();
+      });
+
+      it('should render switch, upgrade, and stop options for LOGIN_WITH_GOOGLE (free tier)', async () => {
+        const { unmount } = await render(
+          <ProQuotaDialog
+            failedModel="gemini-2.5-pro"
+            fallbackModel="gemini-2.5-flash"
+            message="free tier quota error"
+            isTerminalQuotaError={true}
+            isModelNotFoundError={false}
+            authType={AuthType.LOGIN_WITH_GOOGLE}
+            onChoice={mockOnChoice}
+          />,
+        );
+
+        expect(RadioButtonSelect).toHaveBeenCalledWith(
+          expect.objectContaining({
+            items: [
+              {
+                label: 'Switch to gemini-2.5-flash',
+                value: 'retry_always',
+                key: 'retry_always',
+              },
+              {
+                label: 'Upgrade for higher limits',
+                value: 'upgrade',
+                key: 'upgrade',
+              },
+              {
+                label: 'Stop',
+                value: 'retry_later',
+                key: 'retry_later',
+              },
+            ],
+          }),
+          undefined,
+        );
+        unmount();
+      });
+
+      it('should NOT render upgrade option for LOGIN_WITH_GOOGLE if tier is Ultra', async () => {
+        const { unmount } = await render(
+          <ProQuotaDialog
+            failedModel="gemini-2.5-pro"
+            fallbackModel="gemini-2.5-flash"
+            message="free tier quota error"
+            isTerminalQuotaError={true}
+            isModelNotFoundError={false}
+            authType={AuthType.LOGIN_WITH_GOOGLE}
+            tierName="Gemini Advanced Ultra"
+            onChoice={mockOnChoice}
+          />,
+        );
+
+        expect(RadioButtonSelect).toHaveBeenCalledWith(
+          expect.objectContaining({
+            items: [
+              {
+                label: 'Switch to gemini-2.5-flash',
+                value: 'retry_always',
+                key: 'retry_always',
+              },
+              {
+                label: 'Stop',
+                value: 'retry_later',
+                key: 'retry_later',
+              },
+            ],
+          }),
+          undefined,
+        );
+        unmount();
+      });
+    });
+
+    describe('when it is a capacity error', () => {
+      it('should render keep trying, switch, and stop options', async () => {
+        const { unmount } = await render(
+          <ProQuotaDialog
+            failedModel="gemini-2.5-pro"
+            fallbackModel="gemini-2.5-flash"
+            message="capacity error"
+            isTerminalQuotaError={false}
+            isModelNotFoundError={false}
+            onChoice={mockOnChoice}
+          />,
+        );
+
+        expect(RadioButtonSelect).toHaveBeenCalledWith(
+          expect.objectContaining({
+            items: [
+              {
+                label: 'Keep trying',
+                value: 'retry_once',
+                key: 'retry_once',
+              },
+              {
+                label: 'Switch to gemini-2.5-flash',
+                value: 'retry_always',
+                key: 'retry_always',
+              },
+              { label: 'Stop', value: 'retry_later', key: 'retry_later' },
+            ],
+          }),
+          undefined,
+        );
+        unmount();
+      });
+    });
+
+    describe('when it is a model not found error', () => {
+      it('should render switch, upgrade, and stop options for LOGIN_WITH_GOOGLE', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-3-pro-preview"
             fallbackModel="gemini-2.5-pro"
             message="You don't have access to gemini-3-pro-preview yet."
             isTerminalQuotaError={false}
             isModelNotFoundError={true}
+            authType={AuthType.LOGIN_WITH_GOOGLE}
             onChoice={mockOnChoice}
-            userTier={UserTierId.LEGACY}
+          />,
+        );
+
+        expect(RadioButtonSelect).toHaveBeenCalledWith(
+          expect.objectContaining({
+            items: [
+              {
+                label: 'Switch to gemini-2.5-pro',
+                value: 'retry_always',
+                key: 'retry_always',
+              },
+              {
+                label: 'Upgrade for higher limits',
+                value: 'upgrade',
+                key: 'upgrade',
+              },
+              {
+                label: 'Stop',
+                value: 'retry_later',
+                key: 'retry_later',
+              },
+            ],
+          }),
+          undefined,
+        );
+        unmount();
+      });
+
+      it('should NOT render upgrade option for USE_GEMINI', async () => {
+        const { unmount } = await render(
+          <ProQuotaDialog
+            failedModel="gemini-3-pro-preview"
+            fallbackModel="gemini-2.5-pro"
+            message="You don't have access to gemini-3-pro-preview yet."
+            isTerminalQuotaError={false}
+            isModelNotFoundError={true}
+            authType={AuthType.USE_GEMINI}
+            onChoice={mockOnChoice}
           />,
         );
 
@@ -269,15 +348,14 @@ describe('ProQuotaDialog', () => {
   });
 
   describe('onChoice handling', () => {
-    it('should call onChoice with the selected value', () => {
-      const { unmount } = render(
+    it('should call onChoice with the selected value', async () => {
+      const { unmount } = await render(
         <ProQuotaDialog
           failedModel="gemini-2.5-pro"
           fallbackModel="gemini-2.5-flash"
           message=""
           isTerminalQuotaError={false}
           onChoice={mockOnChoice}
-          userTier={UserTierId.FREE}
         />,
       );
 

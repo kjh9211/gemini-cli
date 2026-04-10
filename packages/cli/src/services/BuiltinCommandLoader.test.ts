@@ -52,14 +52,39 @@ vi.mock('../ui/commands/permissionsCommand.js', async () => {
 
 import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
 import { BuiltinCommandLoader } from './BuiltinCommandLoader.js';
-import type { Config } from '@google/gemini-cli-core';
+import { isNightly, type Config } from '@google/gemini-cli-core';
 import { CommandKind } from '../ui/commands/types.js';
 
 import { restoreCommand } from '../ui/commands/restoreCommand.js';
 
+vi.mock('@google/gemini-cli-core', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@google/gemini-cli-core')>();
+  return {
+    ...actual,
+    isNightly: vi.fn().mockResolvedValue(false),
+  };
+});
+
 vi.mock('../ui/commands/authCommand.js', () => ({ authCommand: {} }));
+vi.mock('../ui/commands/agentsCommand.js', () => ({
+  agentsCommand: { name: 'agents' },
+}));
 vi.mock('../ui/commands/bugCommand.js', () => ({ bugCommand: {} }));
-vi.mock('../ui/commands/chatCommand.js', () => ({ chatCommand: {} }));
+vi.mock('../ui/commands/chatCommand.js', () => ({
+  chatCommand: {
+    name: 'chat',
+    subCommands: [
+      { name: 'list' },
+      { name: 'save' },
+      { name: 'resume' },
+      { name: 'delete' },
+      { name: 'share' },
+      { name: 'checkpoints', hidden: true, subCommands: [{ name: 'list' }] },
+    ],
+  },
+  debugCommand: { name: 'debug' },
+}));
 vi.mock('../ui/commands/clearCommand.js', () => ({ clearCommand: {} }));
 vi.mock('../ui/commands/compressCommand.js', () => ({ compressCommand: {} }));
 vi.mock('../ui/commands/corgiCommand.js', () => ({ corgiCommand: {} }));
@@ -69,20 +94,57 @@ vi.mock('../ui/commands/extensionsCommand.js', () => ({
   extensionsCommand: () => ({}),
 }));
 vi.mock('../ui/commands/helpCommand.js', () => ({ helpCommand: {} }));
+vi.mock('../ui/commands/shortcutsCommand.js', () => ({
+  shortcutsCommand: {},
+}));
 vi.mock('../ui/commands/memoryCommand.js', () => ({ memoryCommand: {} }));
 vi.mock('../ui/commands/modelCommand.js', () => ({
   modelCommand: { name: 'model' },
 }));
 vi.mock('../ui/commands/privacyCommand.js', () => ({ privacyCommand: {} }));
 vi.mock('../ui/commands/quitCommand.js', () => ({ quitCommand: {} }));
-vi.mock('../ui/commands/resumeCommand.js', () => ({ resumeCommand: {} }));
+vi.mock('../ui/commands/resumeCommand.js', () => ({
+  resumeCommand: {
+    name: 'resume',
+    subCommands: [
+      { name: 'list' },
+      { name: 'save' },
+      { name: 'resume' },
+      { name: 'delete' },
+      { name: 'share' },
+      { name: 'checkpoints', hidden: true, subCommands: [{ name: 'list' }] },
+    ],
+  },
+}));
 vi.mock('../ui/commands/statsCommand.js', () => ({ statsCommand: {} }));
 vi.mock('../ui/commands/themeCommand.js', () => ({ themeCommand: {} }));
 vi.mock('../ui/commands/toolsCommand.js', () => ({ toolsCommand: {} }));
+vi.mock('../ui/commands/skillsCommand.js', () => ({
+  skillsCommand: { name: 'skills' },
+}));
+vi.mock('../ui/commands/planCommand.js', async () => {
+  const { CommandKind } = await import('../ui/commands/types.js');
+  return {
+    planCommand: {
+      name: 'plan',
+      description: 'Plan command',
+      kind: CommandKind.BUILT_IN,
+    },
+  };
+});
+
 vi.mock('../ui/commands/mcpCommand.js', () => ({
   mcpCommand: {
     name: 'mcp',
     description: 'MCP command',
+    kind: 'BUILT_IN',
+  },
+}));
+
+vi.mock('../ui/commands/upgradeCommand.js', () => ({
+  upgradeCommand: {
+    name: 'upgrade',
+    description: 'Upgrade command',
     kind: 'BUILT_IN',
   },
 }));
@@ -96,9 +158,21 @@ describe('BuiltinCommandLoader', () => {
     vi.clearAllMocks();
     mockConfig = {
       getFolderTrust: vi.fn().mockReturnValue(true),
-      getEnableMessageBusIntegration: () => false,
+      isPlanEnabled: vi.fn().mockReturnValue(true),
       getEnableExtensionReloading: () => false,
       getEnableHooks: () => false,
+      getEnableHooksUI: () => false,
+      getExtensionsEnabled: vi.fn().mockReturnValue(true),
+      isSkillsSupportEnabled: vi.fn().mockReturnValue(true),
+      isAgentsEnabled: vi.fn().mockReturnValue(false),
+      getMcpEnabled: vi.fn().mockReturnValue(true),
+      getSkillManager: vi.fn().mockReturnValue({
+        getAllSkills: vi.fn().mockReturnValue([]),
+        isAdminEnabled: vi.fn().mockReturnValue(true),
+      }),
+      getContentGeneratorConfig: vi.fn().mockReturnValue({
+        authType: 'other',
+      }),
     } as unknown as Config;
 
     restoreCommandMock.mockReturnValue({
@@ -106,6 +180,27 @@ describe('BuiltinCommandLoader', () => {
       description: 'Restore command',
       kind: CommandKind.BUILT_IN,
     });
+  });
+
+  it('should include upgrade command when authType is login_with_google', async () => {
+    const { AuthType } = await import('@google/gemini-cli-core');
+    (mockConfig.getContentGeneratorConfig as Mock).mockReturnValue({
+      authType: AuthType.LOGIN_WITH_GOOGLE,
+    });
+    const loader = new BuiltinCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+    const upgradeCmd = commands.find((c) => c.name === 'upgrade');
+    expect(upgradeCmd).toBeDefined();
+  });
+
+  it('should exclude upgrade command when authType is NOT login_with_google', async () => {
+    (mockConfig.getContentGeneratorConfig as Mock).mockReturnValue({
+      authType: 'other',
+    });
+    const loader = new BuiltinCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+    const upgradeCmd = commands.find((c) => c.name === 'upgrade');
+    expect(upgradeCmd).toBeUndefined();
   });
 
   it('should correctly pass the config object to restore command factory', async () => {
@@ -171,9 +266,10 @@ describe('BuiltinCommandLoader', () => {
 
   it('should include policies command when message bus integration is enabled', async () => {
     const mockConfigWithMessageBus = {
+      // eslint-disable-next-line @typescript-eslint/no-misused-spread
       ...mockConfig,
-      getEnableMessageBusIntegration: () => true,
       getEnableHooks: () => false,
+      getMcpEnabled: () => true,
     } as unknown as Config;
     const loader = new BuiltinCommandLoader(mockConfigWithMessageBus);
     const commands = await loader.loadCommands(new AbortController().signal);
@@ -181,16 +277,102 @@ describe('BuiltinCommandLoader', () => {
     expect(policiesCmd).toBeDefined();
   });
 
-  it('should exclude policies command when message bus integration is disabled', async () => {
-    const mockConfigWithoutMessageBus = {
-      ...mockConfig,
-      getEnableMessageBusIntegration: () => false,
-      getEnableHooks: () => false,
-    } as unknown as Config;
-    const loader = new BuiltinCommandLoader(mockConfigWithoutMessageBus);
+  it('should include agents command when agents are enabled', async () => {
+    mockConfig.isAgentsEnabled = vi.fn().mockReturnValue(true);
+    const loader = new BuiltinCommandLoader(mockConfig);
     const commands = await loader.loadCommands(new AbortController().signal);
-    const policiesCmd = commands.find((c) => c.name === 'policies');
-    expect(policiesCmd).toBeUndefined();
+    const agentsCmd = commands.find((c) => c.name === 'agents');
+    expect(agentsCmd).toBeDefined();
+  });
+
+  it('should include plan command when plan mode is enabled', async () => {
+    (mockConfig.isPlanEnabled as Mock).mockReturnValue(true);
+    const loader = new BuiltinCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+    const planCmd = commands.find((c) => c.name === 'plan');
+    expect(planCmd).toBeDefined();
+  });
+
+  it('should exclude plan command when plan mode is disabled', async () => {
+    (mockConfig.isPlanEnabled as Mock).mockReturnValue(false);
+    const loader = new BuiltinCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+    const planCmd = commands.find((c) => c.name === 'plan');
+    expect(planCmd).toBeUndefined();
+  });
+
+  it('should exclude agents command when agents are disabled', async () => {
+    mockConfig.isAgentsEnabled = vi.fn().mockReturnValue(false);
+    const loader = new BuiltinCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+    const agentsCmd = commands.find((c) => c.name === 'agents');
+    expect(agentsCmd).toBeUndefined();
+  });
+
+  describe('chat debug command', () => {
+    it('should NOT add debug subcommand to chat/resume commands if not a nightly build', async () => {
+      vi.mocked(isNightly).mockResolvedValue(false);
+      const loader = new BuiltinCommandLoader(mockConfig);
+      const commands = await loader.loadCommands(new AbortController().signal);
+
+      const chatCmd = commands.find((c) => c.name === 'chat');
+      expect(chatCmd?.subCommands).toBeDefined();
+      const hasDebug = chatCmd!.subCommands!.some((c) => c.name === 'debug');
+      expect(hasDebug).toBe(false);
+
+      const resumeCmd = commands.find((c) => c.name === 'resume');
+      const resumeHasDebug =
+        resumeCmd?.subCommands?.some((c) => c.name === 'debug') ?? false;
+      expect(resumeHasDebug).toBe(false);
+
+      const chatCheckpointsCmd = chatCmd?.subCommands?.find(
+        (c) => c.name === 'checkpoints',
+      );
+      const chatCheckpointHasDebug =
+        chatCheckpointsCmd?.subCommands?.some((c) => c.name === 'debug') ??
+        false;
+      expect(chatCheckpointHasDebug).toBe(false);
+
+      const resumeCheckpointsCmd = resumeCmd?.subCommands?.find(
+        (c) => c.name === 'checkpoints',
+      );
+      const resumeCheckpointHasDebug =
+        resumeCheckpointsCmd?.subCommands?.some((c) => c.name === 'debug') ??
+        false;
+      expect(resumeCheckpointHasDebug).toBe(false);
+    });
+
+    it('should add debug subcommand to chat/resume commands if it is a nightly build', async () => {
+      vi.mocked(isNightly).mockResolvedValue(true);
+      const loader = new BuiltinCommandLoader(mockConfig);
+      const commands = await loader.loadCommands(new AbortController().signal);
+
+      const chatCmd = commands.find((c) => c.name === 'chat');
+      expect(chatCmd?.subCommands).toBeDefined();
+      const hasDebug = chatCmd!.subCommands!.some((c) => c.name === 'debug');
+      expect(hasDebug).toBe(true);
+
+      const resumeCmd = commands.find((c) => c.name === 'resume');
+      const resumeHasDebug =
+        resumeCmd?.subCommands?.some((c) => c.name === 'debug') ?? false;
+      expect(resumeHasDebug).toBe(true);
+
+      const chatCheckpointsCmd = chatCmd?.subCommands?.find(
+        (c) => c.name === 'checkpoints',
+      );
+      const chatCheckpointHasDebug =
+        chatCheckpointsCmd?.subCommands?.some((c) => c.name === 'debug') ??
+        false;
+      expect(chatCheckpointHasDebug).toBe(true);
+
+      const resumeCheckpointsCmd = resumeCmd?.subCommands?.find(
+        (c) => c.name === 'checkpoints',
+      );
+      const resumeCheckpointHasDebug =
+        resumeCheckpointsCmd?.subCommands?.some((c) => c.name === 'debug') ??
+        false;
+      expect(resumeCheckpointHasDebug).toBe(true);
+    });
   });
 });
 
@@ -201,10 +383,22 @@ describe('BuiltinCommandLoader profile', () => {
     vi.resetModules();
     mockConfig = {
       getFolderTrust: vi.fn().mockReturnValue(false),
+      isPlanEnabled: vi.fn().mockReturnValue(true),
       getCheckpointingEnabled: () => false,
-      getEnableMessageBusIntegration: () => false,
       getEnableExtensionReloading: () => false,
       getEnableHooks: () => false,
+      getEnableHooksUI: () => false,
+      getExtensionsEnabled: vi.fn().mockReturnValue(true),
+      isSkillsSupportEnabled: vi.fn().mockReturnValue(true),
+      isAgentsEnabled: vi.fn().mockReturnValue(false),
+      getMcpEnabled: vi.fn().mockReturnValue(true),
+      getSkillManager: vi.fn().mockReturnValue({
+        getAllSkills: vi.fn().mockReturnValue([]),
+        isAdminEnabled: vi.fn().mockReturnValue(true),
+      }),
+      getContentGeneratorConfig: vi.fn().mockReturnValue({
+        authType: 'other',
+      }),
     } as unknown as Config;
   });
 

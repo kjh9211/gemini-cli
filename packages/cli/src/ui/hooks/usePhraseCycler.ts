@@ -5,111 +5,181 @@
  */
 
 import { useState, useEffect, useRef } from 'react';
-import { SHELL_FOCUS_HINT_DELAY_MS } from '../constants.js';
 import { INFORMATIVE_TIPS } from '../constants/tips.js';
 import { WITTY_LOADING_PHRASES } from '../constants/wittyPhrases.js';
-import { useInactivityTimer } from './useInactivityTimer.js';
 
-export const PHRASE_CHANGE_INTERVAL_MS = 15000;
+export const PHRASE_CHANGE_INTERVAL_MS = 10000;
+export const WITTY_PHRASE_CHANGE_INTERVAL_MS = 5000;
 export const INTERACTIVE_SHELL_WAITING_PHRASE =
-  'Interactive shell awaiting input... press Ctrl+f to focus shell';
+  '! Shell awaiting input (Tab to focus)';
 
 /**
  * Custom hook to manage cycling through loading phrases.
  * @param isActive Whether the phrase cycling should be active.
  * @param isWaiting Whether to show a specific waiting phrase.
- * @param isInteractiveShellWaiting Whether an interactive shell is waiting for input but not focused.
- * @param customPhrases Optional list of custom phrases to use.
+ * @param shouldShowFocusHint Whether to show the shell focus hint.
+ * @param showTips Whether to show informative tips.
+ * @param showWit Whether to show witty phrases.
+ * @param customPhrases Optional list of custom phrases to use instead of built-in witty phrases.
+ * @param maxLength Optional maximum length for the selected phrase.
  * @returns The current loading phrase.
  */
 export const usePhraseCycler = (
   isActive: boolean,
   isWaiting: boolean,
-  isInteractiveShellWaiting: boolean,
-  lastOutputTime: number = 0,
+  shouldShowFocusHint: boolean,
+  showTips: boolean = true,
+  showWit: boolean = true,
   customPhrases?: string[],
+  maxLength?: number,
 ) => {
-  const loadingPhrases =
-    customPhrases && customPhrases.length > 0
-      ? customPhrases
-      : WITTY_LOADING_PHRASES;
+  const [currentTipState, setCurrentTipState] = useState<string | undefined>(
+    undefined,
+  );
+  const [currentWittyPhraseState, setCurrentWittyPhraseState] = useState<
+    string | undefined
+  >(undefined);
 
-  const [currentLoadingPhrase, setCurrentLoadingPhrase] = useState(
-    loadingPhrases[0],
-  );
-  const showShellFocusHint = useInactivityTimer(
-    isInteractiveShellWaiting && lastOutputTime > 0,
-    lastOutputTime,
-    SHELL_FOCUS_HINT_DELAY_MS,
-  );
-  const phraseIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const hasShownFirstRequestTipRef = useRef(false);
+  const tipIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const wittyIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastTipChangeTimeRef = useRef<number>(0);
+  const lastWittyChangeTimeRef = useRef<number>(0);
+  const lastSelectedTipRef = useRef<string | undefined>(undefined);
+  const lastSelectedWittyPhraseRef = useRef<string | undefined>(undefined);
+  const MIN_TIP_DISPLAY_TIME_MS = 10000;
+  const MIN_WIT_DISPLAY_TIME_MS = 5000;
 
   useEffect(() => {
     // Always clear on re-run
-    if (phraseIntervalRef.current) {
-      clearInterval(phraseIntervalRef.current);
-      phraseIntervalRef.current = null;
-    }
-
-    if (isInteractiveShellWaiting && showShellFocusHint) {
-      setCurrentLoadingPhrase(INTERACTIVE_SHELL_WAITING_PHRASE);
-      return;
-    }
-
-    if (isWaiting) {
-      setCurrentLoadingPhrase('Waiting for user confirmation...');
-      return;
-    }
-
-    if (!isActive) {
-      setCurrentLoadingPhrase(loadingPhrases[0]);
-      return;
-    }
-
-    const setRandomPhrase = () => {
-      if (customPhrases && customPhrases.length > 0) {
-        const randomIndex = Math.floor(Math.random() * customPhrases.length);
-        setCurrentLoadingPhrase(customPhrases[randomIndex]);
-      } else {
-        let phraseList;
-        // Show a tip on the first request after startup, then continue with 1/6 chance
-        if (!hasShownFirstRequestTipRef.current) {
-          // Show a tip during the first request
-          phraseList = INFORMATIVE_TIPS;
-          hasShownFirstRequestTipRef.current = true;
-        } else {
-          // Roughly 1 in 6 chance to show a tip after the first request
-          const showTip = Math.random() < 1 / 6;
-          phraseList = showTip ? INFORMATIVE_TIPS : WITTY_LOADING_PHRASES;
-        }
-        const randomIndex = Math.floor(Math.random() * phraseList.length);
-        setCurrentLoadingPhrase(phraseList[randomIndex]);
+    const clearTimers = () => {
+      if (tipIntervalRef.current) {
+        clearInterval(tipIntervalRef.current);
+        tipIntervalRef.current = null;
+      }
+      if (wittyIntervalRef.current) {
+        clearInterval(wittyIntervalRef.current);
+        wittyIntervalRef.current = null;
       }
     };
 
-    // Select an initial random phrase
-    setRandomPhrase();
+    clearTimers();
 
-    phraseIntervalRef.current = setInterval(() => {
-      // Select a new random phrase
-      setRandomPhrase();
-    }, PHRASE_CHANGE_INTERVAL_MS);
+    if (shouldShowFocusHint || isWaiting) {
+      // These are handled by the return value directly for immediate feedback
+      return clearTimers;
+    }
 
-    return () => {
-      if (phraseIntervalRef.current) {
-        clearInterval(phraseIntervalRef.current);
-        phraseIntervalRef.current = null;
+    if (!isActive || (!showTips && !showWit)) {
+      return clearTimers;
+    }
+
+    const wittyPhrasesList =
+      customPhrases && customPhrases.length > 0
+        ? customPhrases
+        : WITTY_LOADING_PHRASES;
+
+    const setRandomTip = (force: boolean = false) => {
+      if (!showTips) {
+        setCurrentTipState(undefined);
+        lastSelectedTipRef.current = undefined;
+        return;
+      }
+
+      const now = Date.now();
+      if (
+        !force &&
+        now - lastTipChangeTimeRef.current < MIN_TIP_DISPLAY_TIME_MS &&
+        lastSelectedTipRef.current
+      ) {
+        setCurrentTipState(lastSelectedTipRef.current);
+        return;
+      }
+
+      const filteredTips =
+        maxLength !== undefined
+          ? INFORMATIVE_TIPS.filter((p) => p.length <= maxLength)
+          : INFORMATIVE_TIPS;
+
+      if (filteredTips.length > 0) {
+        // codeql[js/insecure-randomness] false positive: used for non-sensitive UI flavor text (tips)
+        const selected =
+          filteredTips[Math.floor(Math.random() * filteredTips.length)];
+        setCurrentTipState(selected);
+        lastSelectedTipRef.current = selected;
+        lastTipChangeTimeRef.current = now;
       }
     };
+
+    const setRandomWitty = (force: boolean = false) => {
+      if (!showWit) {
+        setCurrentWittyPhraseState(undefined);
+        lastSelectedWittyPhraseRef.current = undefined;
+        return;
+      }
+
+      const now = Date.now();
+      if (
+        !force &&
+        now - lastWittyChangeTimeRef.current < MIN_WIT_DISPLAY_TIME_MS &&
+        lastSelectedWittyPhraseRef.current
+      ) {
+        setCurrentWittyPhraseState(lastSelectedWittyPhraseRef.current);
+        return;
+      }
+
+      const filteredWitty =
+        maxLength !== undefined
+          ? wittyPhrasesList.filter((p) => p.length <= maxLength)
+          : wittyPhrasesList;
+
+      if (filteredWitty.length > 0) {
+        // codeql[js/insecure-randomness] false positive: used for non-sensitive UI flavor text (witty phrases)
+        const selected =
+          filteredWitty[Math.floor(Math.random() * filteredWitty.length)];
+        setCurrentWittyPhraseState(selected);
+        lastSelectedWittyPhraseRef.current = selected;
+        lastWittyChangeTimeRef.current = now;
+      }
+    };
+
+    // Select initial random phrases or resume previous ones
+    setRandomTip(false);
+    setRandomWitty(false);
+
+    if (showTips) {
+      tipIntervalRef.current = setInterval(() => {
+        setRandomTip(true);
+      }, PHRASE_CHANGE_INTERVAL_MS);
+    }
+
+    if (showWit) {
+      wittyIntervalRef.current = setInterval(() => {
+        setRandomWitty(true);
+      }, WITTY_PHRASE_CHANGE_INTERVAL_MS);
+    }
+
+    return clearTimers;
   }, [
     isActive,
     isWaiting,
-    isInteractiveShellWaiting,
+    shouldShowFocusHint,
+    showTips,
+    showWit,
     customPhrases,
-    loadingPhrases,
-    showShellFocusHint,
+    maxLength,
   ]);
 
-  return currentLoadingPhrase;
+  let currentTip = undefined;
+  let currentWittyPhrase = undefined;
+
+  if (shouldShowFocusHint) {
+    currentTip = INTERACTIVE_SHELL_WAITING_PHRASE;
+  } else if (isWaiting) {
+    currentTip = 'Waiting for user confirmation...';
+  } else if (isActive) {
+    currentTip = currentTipState;
+    currentWittyPhrase = currentWittyPhraseState;
+  }
+
+  return { currentTip, currentWittyPhrase };
 };
